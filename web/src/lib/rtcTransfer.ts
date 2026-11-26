@@ -63,6 +63,8 @@ const MAX_CHUNK_BYTES = 64 * 1024
 const FALLBACK_CHUNK_BYTES = 16 * 1024
 const BUFFER_LOW_THRESHOLD = 256 * 1024
 const BUFFER_HIGH_THRESHOLD = 1024 * 1024
+const BUFFER_DRAIN_TIMEOUT_MS = 15_000
+const CHANNEL_CLOSE_GRACE_MS = 2_000
 const DEFAULT_CONNECT_TIMEOUT_MS = 8_000
 
 interface InternalSession {
@@ -162,6 +164,7 @@ export class TransferManager {
     if (!s || s.task.direction !== 'receive' || s.task.state !== 'pending') {
       return
     }
+    s.abortController.abort()
     s.task.state = 'rejected'
     this.emit(s)
     this.deps.sendSignal(s.task.peerId, 'file.reject', transferId, {})
@@ -190,6 +193,9 @@ export class TransferManager {
     data: unknown,
     autoAccept = false
   ): Promise<void> {
+    if (!transferId || !transferId.trim()) {
+      return
+    }
     if (signalType === 'file.offer') {
       if (this.sessions.has(transferId)) {
         return
@@ -243,7 +249,14 @@ export class TransferManager {
         }
         break
       case 'rtc.offer':
-        if (s.task.direction === 'receive' && s.task.state === 'connecting' && !s.fallbackTriggered && data) {
+        if (
+          s.task.direction === 'receive' &&
+          s.task.state === 'connecting' &&
+          !s.pc &&
+          !s.fallbackTriggered &&
+          !s.abortController.signal.aborted &&
+          data
+        ) {
           await this.handleReceiverOffer(s, data as RTCSessionDescriptionInit)
         }
         break
@@ -253,15 +266,32 @@ export class TransferManager {
           s.pc &&
           s.task.state === 'connecting' &&
           !s.fallbackTriggered &&
+          !s.abortController.signal.aborted &&
           data
         ) {
-          await s.pc.setRemoteDescription(data as RTCSessionDescriptionInit)
+          const pc = s.pc
+          try {
+            await pc.setRemoteDescription(data as RTCSessionDescriptionInit)
+          } catch {
+            if (
+              s.task.state === 'connecting' &&
+              !s.abortController.signal.aborted &&
+              !s.fallbackTriggered &&
+              s.pc === pc
+            ) {
+              await this.handleWebRTCConnectFailure(s)
+            }
+            break
+          }
+          if (s.abortController.signal.aborted || s.fallbackTriggered || s.pc !== pc) {
+            break
+          }
           s.remoteDescriptionSet = true
           await this.flushPendingIceCandidates(s)
         }
         break
       case 'rtc.ice':
-        if (!this.isTerminalState(s.task.state) && !s.fallbackTriggered && data) {
+        if (!this.isTerminalState(s.task.state) && !s.fallbackTriggered && !s.abortController.signal.aborted && data) {
           const candidate = data as RTCIceCandidateInit
           if (s.pc && s.remoteDescriptionSet) {
             await s.pc.addIceCandidate(candidate).catch(() => undefined)
@@ -271,7 +301,12 @@ export class TransferManager {
         }
         break
       case 'relay.start':
-        if (s.task.direction === 'receive' && !this.isTerminalState(s.task.state) && !s.fallbackTriggered) {
+        if (
+          s.task.direction === 'receive' &&
+          (s.task.state === 'connecting' || s.task.state === 'transferring') &&
+          !s.fallbackTriggered &&
+          !s.abortController.signal.aborted
+        ) {
           s.fallbackTriggered = true
           this.cleanupPeerConnection(s)
           await this.abortActiveSink(s)
@@ -348,77 +383,113 @@ export class TransferManager {
   }
 
   private async startSenderWebRTC(s: InternalSession): Promise<void> {
+    if (s.pc || s.abortController.signal.aborted || s.fallbackTriggered || this.isTerminalState(s.task.state)) {
+      return
+    }
     s.task.state = 'connecting'
     this.emit(s)
 
+    if (s.pc || s.abortController.signal.aborted || s.fallbackTriggered || s.task.state !== 'connecting') {
+      return
+    }
+
+    let pc: RTCPeerConnection | null = null
     try {
-      const pc = new RTCPeerConnection({ iceServers: this.deps.getIceServers() })
-      s.pc = pc
-      const dc = pc.createDataChannel('pingdrop-transfer', { ordered: true })
+      pc = new RTCPeerConnection({ iceServers: this.deps.getIceServers() })
+      const currentPc = pc
+      s.pc = currentPc
+      const dc = currentPc.createDataChannel('pingdrop-transfer', { ordered: true })
       dc.binaryType = 'arraybuffer'
       dc.bufferedAmountLowThreshold = BUFFER_LOW_THRESHOLD
       s.dc = dc
 
-      pc.onicecandidate = (ev) => {
-        if (ev.candidate) {
+      currentPc.onicecandidate = (ev) => {
+        if (ev.candidate && !s.abortController.signal.aborted && !s.fallbackTriggered && s.pc === currentPc) {
           const init = typeof ev.candidate.toJSON === 'function' ? ev.candidate.toJSON() : ev.candidate
           this.deps.sendSignal(s.task.peerId, 'rtc.ice', s.task.transferId, init)
         }
       }
 
-      pc.oniceconnectionstatechange = () => {
-        if (pc.iceConnectionState === 'failed' && s.task.state === 'connecting') {
+      currentPc.oniceconnectionstatechange = () => {
+        if (currentPc.iceConnectionState === 'failed' && s.task.state === 'connecting') {
           void this.handleWebRTCConnectFailure(s)
         }
       }
 
-      pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'failed' && s.task.state === 'connecting') {
+      currentPc.onconnectionstatechange = () => {
+        if (currentPc.connectionState === 'failed' && s.task.state === 'connecting') {
           void this.handleWebRTCConnectFailure(s)
         }
       }
 
       dc.onopen = () => {
-        if (s.fallbackTriggered || s.abortController.signal.aborted || s.task.state !== 'connecting') {
+        if (
+          s.fallbackTriggered ||
+          s.abortController.signal.aborted ||
+          s.task.state !== 'connecting' ||
+          s.pc !== currentPc
+        ) {
           return
         }
         this.clearConnectTimer(s)
-        void this.streamOutgoingWebRTC(s, pc, dc)
+        void this.streamOutgoingWebRTC(s, currentPc, dc)
       }
 
       s.connectTimer = setTimeout(() => {
-        if (s.task.state === 'connecting') {
+        if (s.task.state === 'connecting' && s.pc === currentPc) {
           void this.handleWebRTCConnectFailure(s)
         }
       }, this.connectTimeoutMs)
 
-      const offer = await pc.createOffer()
-      if (s.abortController.signal.aborted || s.fallbackTriggered) {
+      const offer = await currentPc.createOffer()
+      if (s.abortController.signal.aborted || s.fallbackTriggered || s.pc !== currentPc) {
         return
       }
-      await pc.setLocalDescription(offer)
+      await currentPc.setLocalDescription(offer)
+      if (s.abortController.signal.aborted || s.fallbackTriggered || s.pc !== currentPc) {
+        return
+      }
       this.deps.sendSignal(s.task.peerId, 'rtc.offer', s.task.transferId, offer)
     } catch {
-      if (s.task.state === 'connecting' && !s.abortController.signal.aborted) {
+      if (
+        s.task.state === 'connecting' &&
+        !s.abortController.signal.aborted &&
+        !s.fallbackTriggered &&
+        (!pc || s.pc === pc)
+      ) {
         await this.handleWebRTCConnectFailure(s)
       }
     }
   }
 
   private async handleReceiverOffer(s: InternalSession, offer: RTCSessionDescriptionInit): Promise<void> {
+    if (
+      s.pc ||
+      s.abortController.signal.aborted ||
+      s.fallbackTriggered ||
+      s.task.state !== 'connecting' ||
+      this.isTerminalState(s.task.state)
+    ) {
+      return
+    }
     try {
       const pc = new RTCPeerConnection({ iceServers: this.deps.getIceServers() })
       s.pc = pc
 
       pc.onicecandidate = (ev) => {
-        if (ev.candidate) {
+        if (ev.candidate && !s.abortController.signal.aborted && !s.fallbackTriggered && s.pc === pc) {
           const init = typeof ev.candidate.toJSON === 'function' ? ev.candidate.toJSON() : ev.candidate
           this.deps.sendSignal(s.task.peerId, 'rtc.ice', s.task.transferId, init)
         }
       }
 
       pc.ondatachannel = (ev) => {
-        if (s.abortController.signal.aborted || s.fallbackTriggered || this.isTerminalState(s.task.state)) {
+        if (
+          s.abortController.signal.aborted ||
+          s.fallbackTriggered ||
+          s.pc !== pc ||
+          this.isTerminalState(s.task.state)
+        ) {
           return
         }
         const dc = ev.channel
@@ -431,7 +502,12 @@ export class TransferManager {
           // 串行排空接收消息，防止 file.start / 异步写盘 / file.end 并发竞态
           s.receiveQueue = s.receiveQueue
             .then(async () => {
-              if (s.abortController.signal.aborted || s.fallbackTriggered || this.isTerminalState(s.task.state)) {
+              if (
+                s.abortController.signal.aborted ||
+                s.fallbackTriggered ||
+                s.pc !== pc ||
+                this.isTerminalState(s.task.state)
+              ) {
                 return
               }
               await this.handleReceiverDataMessage(s, msgEv.data)
@@ -457,13 +533,22 @@ export class TransferManager {
       }
 
       await pc.setRemoteDescription(offer)
+      if (s.abortController.signal.aborted || s.fallbackTriggered || s.pc !== pc) {
+        return
+      }
       s.remoteDescriptionSet = true
       await this.flushPendingIceCandidates(s)
+      if (s.abortController.signal.aborted || s.fallbackTriggered || s.pc !== pc) {
+        return
+      }
       const answer = await pc.createAnswer()
-      if (s.abortController.signal.aborted || s.fallbackTriggered) {
+      if (s.abortController.signal.aborted || s.fallbackTriggered || s.pc !== pc) {
         return
       }
       await pc.setLocalDescription(answer)
+      if (s.abortController.signal.aborted || s.fallbackTriggered || s.pc !== pc) {
+        return
+      }
       this.deps.sendSignal(s.task.peerId, 'rtc.answer', s.task.transferId, answer)
     } catch (err) {
       if (!s.abortController.signal.aborted && !s.fallbackTriggered && !this.isTerminalState(s.task.state)) {
@@ -476,8 +561,12 @@ export class TransferManager {
     s.task.state = 'transferring'
     this.emit(s)
     const chunkSize = resolveChunkSize(pc.sctp?.maxMessageSize)
+    let allFilesSent = false
 
     dc.onclose = () => {
+      if (allFilesSent && dc.bufferedAmount === 0) {
+        return
+      }
       if (!s.abortController.signal.aborted && s.task.state === 'transferring') {
         s.task.state = 'failed'
         s.task.speedBps = 0
@@ -541,14 +630,23 @@ export class TransferManager {
         )
       }
 
+      allFilesSent = true
+      if (s.abortController.signal.aborted) {
+        return
+      }
+      // 等待发送缓冲区彻底排空（bufferedAmount === 0）后再标记完成与关连，防止丢失末尾分片或 file.end
+      await waitBufferedDrained(dc, s.abortController.signal, BUFFER_DRAIN_TIMEOUT_MS)
       if (s.abortController.signal.aborted) {
         return
       }
       s.task.state = 'completed'
       s.task.speedBps = 0
       this.emit(s)
+      // 缓冲区排空后再短暂等待接收方关闭通道，避免过早发送 SCTP ABORT
+      await waitChannelClosed(dc, s.abortController.signal, CHANNEL_CLOSE_GRACE_MS)
     } catch (err) {
       if (!s.abortController.signal.aborted && !this.isTerminalState(s.task.state)) {
+        s.abortController.abort()
         s.task.state = 'failed'
         s.task.speedBps = 0
         s.task.errorMessage = err instanceof Error ? err.message : 'WebRTC 发送异常'
@@ -564,14 +662,23 @@ export class TransferManager {
       const ctrl = JSON.parse(data) as ControlPacket
       if (ctrl.type === 'file.start') {
         await this.abortActiveSink(s)
-        s.activeFileIndex = ctrl.fileIndex ?? 0
-        s.task.currentFileIndex = s.activeFileIndex
-        s.activeExpectedSize = ctrl.size ?? 0
+        const fileIndex = ctrl.fileIndex ?? 0
+        s.activeFileIndex = fileIndex
+        s.task.currentFileIndex = fileIndex
+        const offeredMeta = s.task.files[fileIndex]
+        const startSize = ctrl.size ?? offeredMeta?.size ?? 0
+        if (!Number.isFinite(startSize) || startSize < 0) {
+          throw new Error(`invalid file.start size: ${String(ctrl.size)}`)
+        }
+        if (offeredMeta && typeof offeredMeta.size === 'number' && startSize !== offeredMeta.size) {
+          throw new Error(`file.start size mismatch: offered ${offeredMeta.size}, got ${startSize}`)
+        }
+        s.activeExpectedSize = startSize
         s.activeReceivedBytes = 0
         s.activeFileMeta = {
-          name: ctrl.name ?? 'file.bin',
+          name: ctrl.name ?? offeredMeta?.name ?? 'file.bin',
           size: s.activeExpectedSize,
-          mime: ctrl.mime ?? 'application/octet-stream'
+          mime: ctrl.mime ?? offeredMeta?.mime ?? 'application/octet-stream'
         }
         const sink = await createChunkSink(s.task.transferId, s.activeFileIndex, s.activeFileMeta.name)
         if (s.abortController.signal.aborted || s.fallbackTriggered) {
@@ -587,6 +694,13 @@ export class TransferManager {
           throw new Error('unexpected file.end without active file')
         }
         const expected = ctrl.totalBytes ?? s.activeExpectedSize
+        const offeredMeta = s.task.files[s.activeFileIndex]
+        if (offeredMeta && typeof offeredMeta.size === 'number' && expected !== offeredMeta.size) {
+          throw new Error(`file.end size mismatch: offered ${offeredMeta.size}, got ${expected}`)
+        }
+        if (ctrl.totalBytes !== undefined && ctrl.totalBytes !== s.activeExpectedSize) {
+          throw new Error(`file.end size mismatch: expected ${s.activeExpectedSize}, got ${ctrl.totalBytes}`)
+        }
         if (s.activeReceivedBytes !== expected) {
           throw new Error(`byte size mismatch: expected ${expected}, got ${s.activeReceivedBytes}`)
         }
@@ -650,6 +764,7 @@ export class TransferManager {
     const maxRelayBytes = Number.isFinite(maxRelayMB) && maxRelayMB > 0 ? maxRelayMB * 1024 * 1024 : 0
     const canRelay = maxRelayBytes > 0 && s.rawFiles.every((f) => f.size <= maxRelayBytes)
     if (!canRelay) {
+      s.abortController.abort()
       s.task.state = 'failed'
       s.task.speedBps = 0
       s.task.errorMessage =
@@ -697,6 +812,7 @@ export class TransferManager {
       this.emit(s)
     } catch (err) {
       if (!s.abortController.signal.aborted && !this.isTerminalState(s.task.state)) {
+        s.abortController.abort()
         s.task.state = 'failed'
         s.task.speedBps = 0
         s.task.errorMessage = err instanceof Error ? err.message : '服务器中转上传失败'
@@ -740,6 +856,7 @@ export class TransferManager {
             if (done) break
             if (s.abortController.signal.aborted) {
               await reader.cancel().catch(() => undefined)
+              await this.abortActiveSink(s)
               return
             }
             if (value) {
@@ -749,6 +866,10 @@ export class TransferManager {
           }
         } else {
           const buf = new Uint8Array(await res.arrayBuffer())
+          if (s.abortController.signal.aborted) {
+            await this.abortActiveSink(s)
+            return
+          }
           await sink.write(buf)
           this.advanceProgress(s, buf.byteLength)
         }
@@ -778,8 +899,10 @@ export class TransferManager {
       s.task.speedBps = 0
       this.emit(s)
     } catch (err) {
+      const wasAborted = s.abortController.signal.aborted
+      s.abortController.abort()
       await this.abortActiveSink(s)
-      if (!s.abortController.signal.aborted && !this.isTerminalState(s.task.state)) {
+      if (!wasAborted && !this.isTerminalState(s.task.state)) {
         s.task.state = 'failed'
         s.task.speedBps = 0
         s.task.errorMessage = err instanceof Error ? err.message : '服务器中转下载失败'
@@ -792,9 +915,13 @@ export class TransferManager {
     if (!s.pc || !s.remoteDescriptionSet || s.pendingIceCandidates.length === 0) {
       return
     }
+    const pc = s.pc
     const candidates = s.pendingIceCandidates.splice(0, s.pendingIceCandidates.length)
     for (const candidate of candidates) {
-      await s.pc.addIceCandidate(candidate).catch(() => undefined)
+      if (s.abortController.signal.aborted || s.fallbackTriggered || s.pc !== pc) {
+        return
+      }
+      await pc.addIceCandidate(candidate).catch(() => undefined)
     }
   }
 
@@ -877,31 +1004,79 @@ export class TransferManager {
   }
 }
 
+interface BufferWaitOptions {
+  targetAmount?: number
+  timeoutMs?: number
+  resolveOnDrainedClose?: boolean
+}
+
 function waitBufferedLow(dc: RTCDataChannel, signal: AbortSignal): Promise<void> {
+  return waitDataChannelBuffer(dc, signal, {})
+}
+
+function waitBufferedDrained(dc: RTCDataChannel, signal: AbortSignal, timeoutMs: number): Promise<void> {
   if (signal.aborted) {
     return Promise.reject(new Error('aborted'))
+  }
+  if (dc.bufferedAmount === 0) {
+    return Promise.resolve()
+  }
+  dc.bufferedAmountLowThreshold = 0
+  return waitDataChannelBuffer(dc, signal, {
+    targetAmount: 0,
+    timeoutMs,
+    resolveOnDrainedClose: true
+  })
+}
+
+function waitDataChannelBuffer(dc: RTCDataChannel, signal: AbortSignal, opts: BufferWaitOptions): Promise<void> {
+  if (signal.aborted) {
+    return Promise.reject(new Error('aborted'))
+  }
+  if (opts.targetAmount !== undefined && dc.bufferedAmount <= opts.targetAmount) {
+    return Promise.resolve()
+  }
+  if (dc.readyState === 'closed') {
+    return Promise.reject(new Error('datachannel closed'))
   }
   return new Promise((resolve, reject) => {
     let settled = false
     const hasEventTarget = typeof dc.addEventListener === 'function' && typeof dc.removeEventListener === 'function'
     const prevOnLow = dc.onbufferedamountlow
+    const prevOnClose = dc.onclose
+    let timer: ReturnType<typeof setTimeout> | null = null
 
     const cleanup = () => {
+      if (timer !== null) {
+        clearTimeout(timer)
+        timer = null
+      }
       signal.removeEventListener('abort', onAbort)
       if (hasEventTarget) {
         dc.removeEventListener('bufferedamountlow', onLow)
         dc.removeEventListener('close', onClose)
-      }
-      if (dc.onbufferedamountlow === onLowProp) {
-        dc.onbufferedamountlow = prevOnLow
+      } else {
+        if (dc.onbufferedamountlow === onLowProp) {
+          dc.onbufferedamountlow = prevOnLow
+        }
+        if (dc.onclose === onCloseProp) {
+          dc.onclose = prevOnClose
+        }
       }
     }
 
-    const onLow = () => {
+    const finish = (fn: () => void) => {
       if (settled) return
       settled = true
       cleanup()
-      resolve()
+      fn()
+    }
+
+    const onLow = () => {
+      if (opts.targetAmount !== undefined && dc.bufferedAmount > opts.targetAmount) {
+        return
+      }
+      finish(resolve)
     }
 
     const onLowProp = (ev: Event) => {
@@ -910,17 +1085,26 @@ function waitBufferedLow(dc: RTCDataChannel, signal: AbortSignal): Promise<void>
     }
 
     const onClose = () => {
-      if (settled) return
-      settled = true
-      cleanup()
-      reject(new Error('datachannel closed'))
+      if (opts.resolveOnDrainedClose && dc.bufferedAmount <= (opts.targetAmount ?? 0)) {
+        finish(resolve)
+        return
+      }
+      finish(() => reject(new Error('datachannel closed')))
+    }
+
+    const onCloseProp = (ev: Event) => {
+      prevOnClose?.call(dc, ev)
+      onClose()
     }
 
     const onAbort = () => {
-      if (settled) return
-      settled = true
-      cleanup()
-      reject(new Error('aborted'))
+      finish(() => reject(new Error('aborted')))
+    }
+
+    if (opts.timeoutMs !== undefined) {
+      timer = setTimeout(() => {
+        finish(() => reject(new Error('WebRTC 发送缓冲区排空超时')))
+      }, opts.timeoutMs)
     }
 
     if (hasEventTarget) {
@@ -928,8 +1112,54 @@ function waitBufferedLow(dc: RTCDataChannel, signal: AbortSignal): Promise<void>
       dc.addEventListener('close', onClose)
     } else {
       dc.onbufferedamountlow = onLowProp as (this: RTCDataChannel, ev: Event) => unknown
+      dc.onclose = onCloseProp as (this: RTCDataChannel, ev: Event) => unknown
     }
     signal.addEventListener('abort', onAbort)
+  })
+}
+
+function waitChannelClosed(dc: RTCDataChannel, signal: AbortSignal, timeoutMs: number): Promise<void> {
+  if (signal.aborted || dc.readyState === 'closed') {
+    return Promise.resolve()
+  }
+  return new Promise((resolve) => {
+    let settled = false
+    const hasEventTarget = typeof dc.addEventListener === 'function' && typeof dc.removeEventListener === 'function'
+    const prevOnClose = dc.onclose
+    let timer: ReturnType<typeof setTimeout> | null = null
+
+    const cleanup = () => {
+      if (timer !== null) {
+        clearTimeout(timer)
+        timer = null
+      }
+      signal.removeEventListener('abort', done)
+      if (hasEventTarget) {
+        dc.removeEventListener('close', done)
+      } else if (dc.onclose === onCloseProp) {
+        dc.onclose = prevOnClose
+      }
+    }
+
+    const done = () => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve()
+    }
+
+    const onCloseProp = (ev: Event) => {
+      prevOnClose?.call(dc, ev)
+      done()
+    }
+
+    timer = setTimeout(done, timeoutMs)
+    if (hasEventTarget) {
+      dc.addEventListener('close', done)
+    } else {
+      dc.onclose = onCloseProp as (this: RTCDataChannel, ev: Event) => unknown
+    }
+    signal.addEventListener('abort', done)
   })
 }
 

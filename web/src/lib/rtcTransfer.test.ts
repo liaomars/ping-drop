@@ -727,31 +727,42 @@ describe('rtcTransfer', () => {
     const origCreateDc = MockPeerConnection.prototype.createDataChannel
     MockPeerConnection.prototype.createDataChannel = () => minimalDc as unknown as RTCDataChannel
 
-    const updates: TransferTask[] = []
-    const mgr = new TransferManager({
-      sendSignal: vi.fn(),
-      getSessionToken: () => 'tok-min',
-      getIceServers: () => [],
-      getMaxRelayMB: () => 50,
-      onUpdate: (t) => updates.push(t)
-    })
+    try {
+      const updates: TransferTask[] = []
+      const mgr = new TransferManager({
+        sendSignal: vi.fn(),
+        getSessionToken: () => 'tok-min',
+        getIceServers: () => [],
+        getMaxRelayMB: () => 50,
+        onUpdate: (t) => updates.push(t)
+      })
 
-    const emptyFile = new File([], 'empty.txt', { type: 'text/plain' })
-    const nonEmptyFile = new File([new Uint8Array(20 * 1024)], 'part.bin')
-    const tx = mgr.startOutgoing('peer-b', 'Phone', [emptyFile, nonEmptyFile])
-    await mgr.handleSignal('peer-b', 'Phone', 'file.accept', tx.transferId, {})
+      const emptyFile = new File([], 'empty.txt', { type: 'text/plain' })
+      const nonEmptyFile = new File([new Uint8Array(20 * 1024)], 'part.bin')
+      const tx = mgr.startOutgoing('peer-b', 'Phone', [emptyFile, nonEmptyFile])
+      await mgr.handleSignal('peer-b', 'Phone', 'file.accept', tx.transferId, {})
 
-    minimalDc.onopen?.()
-    await vi.advanceTimersByTimeAsync(10)
+      minimalDc.onopen?.()
+      await vi.advanceTimersByTimeAsync(10)
 
-    // 第一片 16KB 发送后触发 bufferedAmount >= 1MB 暂停
-    expect(updates.at(-1)?.state).toBe('transferring')
-    minimalDc.bufferedAmount = 0
-    minimalDc.onbufferedamountlow?.()
-    await vi.advanceTimersByTimeAsync(10)
+      // 第一片 16KB 发送后触发 bufferedAmount >= 1MB 暂停
+      expect(updates.at(-1)?.state).toBe('transferring')
+      minimalDc.bufferedAmount = 0
+      minimalDc.onbufferedamountlow?.()
+      await vi.advanceTimersByTimeAsync(10)
 
-    expect(updates.at(-1)?.state).toBe('completed')
-    MockPeerConnection.prototype.createDataChannel = origCreateDc
+      // 第二片 4KB 发送后再次置 bufferedAmount = 1MB 并发送 file.end，此时应等待缓冲区排空为 0 后才标记 completed
+      expect(updates.at(-1)?.state).toBe('transferring')
+      expect(minimalDc.bufferedAmountLowThreshold).toBe(0)
+      minimalDc.bufferedAmount = 0
+      minimalDc.onbufferedamountlow?.()
+      await vi.advanceTimersByTimeAsync(10)
+
+      expect(updates.at(-1)?.state).toBe('completed')
+      await vi.advanceTimersByTimeAsync(2000)
+    } finally {
+      MockPeerConnection.prototype.createDataChannel = origCreateDc
+    }
 
     // 2. 服务端中转下载 HTTP 非 200 错误时，receiver 应清理活跃 sink 并标记 failed
     const errFetcher = vi.fn().mockResolvedValue(new Response('bad gateway', { status: 502 }))
@@ -776,5 +787,342 @@ describe('rtcTransfer', () => {
     await rxMgr.handleSignal('peer-a', 'Laptop', 'relay.start', 'tx-relay-err', {})
     expect(rxUpdates.at(-1)?.state).toBe('failed')
     expect(rxUpdates.at(-1)?.errorMessage).toContain('relay download failed: 502')
+  })
+
+  it('waits for DataChannel bufferedAmount to drain to 0 before marking completed and waits grace period before closing PC', async () => {
+    // 1. bufferedAmount 未排空前不关闭 PC，排空后等待对端关闭通道（或在 2s 宽限期后正常收尾）
+    const updates: TransferTask[] = []
+    const mgr = new TransferManager({
+      sendSignal: vi.fn(),
+      getSessionToken: () => 'tok-drain',
+      getIceServers: () => [],
+      getMaxRelayMB: () => 100,
+      onUpdate: (t) => updates.push(t)
+    })
+
+    const f1 = new File([new Uint8Array([1, 2, 3, 4, 5])], 'drain.bin')
+    const t1 = mgr.startOutgoing('peer-b', 'Phone', [f1])
+    await mgr.handleSignal('peer-b', 'Phone', 'file.accept', t1.transferId, {})
+
+    const pc1 = MockPeerConnection.instances[0]
+    const dc1 = pc1.createdDataChannel!
+    dc1.onSend = (data, dc) => {
+      if (typeof data === 'string' && JSON.parse(data).type === 'file.end') {
+        dc.bufferedAmount = 512
+      }
+    }
+
+    dc1.emitEvent('open')
+    await vi.advanceTimersByTimeAsync(10)
+
+    expect(dc1.bufferedAmountLowThreshold).toBe(0)
+    expect(updates.at(-1)?.state).toBe('transferring')
+    expect(pc1.closed).toBe(false)
+
+    // 尚未完全降为 0 时继续等待
+    dc1.bufferedAmount = 128
+    dc1.emitEvent('bufferedamountlow')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(updates.at(-1)?.state).toBe('transferring')
+    expect(pc1.closed).toBe(false)
+
+    // 完全排空为 0 后标记 completed，并在 2s 宽限期内等待接收方关闭 DC
+    dc1.bufferedAmount = 0
+    dc1.emitEvent('bufferedamountlow')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(updates.at(-1)?.state).toBe('completed')
+    expect(pc1.closed).toBe(false)
+
+    // 模拟接收端处理完 file.end 后关闭 DataChannel，不应误判失败且立即关闭 PC
+    dc1.close()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(updates.at(-1)?.state).toBe('completed')
+    expect(pc1.closed).toBe(true)
+
+    // 2. 若接收端未显式关闭 DC，2s 宽限期到期后亦应正常关闭 PC
+    const t2 = mgr.startOutgoing('peer-b', 'Phone', [f1])
+    await mgr.handleSignal('peer-b', 'Phone', 'file.accept', t2.transferId, {})
+    const pc2 = MockPeerConnection.instances[1]
+    const dc2 = pc2.createdDataChannel!
+    dc2.emitEvent('open')
+    await vi.advanceTimersByTimeAsync(10)
+
+    expect(updates.at(-1)?.state).toBe('completed')
+    expect(pc2.closed).toBe(false)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(pc2.closed).toBe(true)
+
+    // 3. 若对端卡死导致 bufferedAmount 15s 内未排空，应超时失败并关闭 PC
+    const t3 = mgr.startOutgoing('peer-b', 'Phone', [f1])
+    await mgr.handleSignal('peer-b', 'Phone', 'file.accept', t3.transferId, {})
+    const pc3 = MockPeerConnection.instances[2]
+    const dc3 = pc3.createdDataChannel!
+    dc3.onSend = (data, dc) => {
+      if (typeof data === 'string' && JSON.parse(data).type === 'file.end') {
+        dc.bufferedAmount = 1024
+      }
+    }
+    dc3.emitEvent('open')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(dc3.bufferedAmountLowThreshold).toBe(0)
+    expect(updates.at(-1)?.state).toBe('transferring')
+
+    await vi.advanceTimersByTimeAsync(14980)
+    expect(updates.at(-1)?.state).toBe('transferring')
+    expect(pc3.closed).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(20)
+    expect(updates.at(-1)?.state).toBe('failed')
+    expect(pc3.closed).toBe(true)
+  })
+
+  it('ignores duplicate rtc.offer without leaking RTCPeerConnection and aborts signaling if cancelled during setLocalDescription', async () => {
+    const signals: Array<{ type: SignalType; id: string }> = []
+    const mgr = new TransferManager({
+      sendSignal: (_to, type, id) => signals.push({ type, id }),
+      getSessionToken: () => 'tok-dup',
+      getIceServers: () => [],
+      getMaxRelayMB: () => 100,
+      onUpdate: vi.fn()
+    })
+
+    // 1. 接收端在首条 rtc.offer 协商期间及协商完成后收到重复 rtc.offer，只创建 1 个 PC 并只回复 1 次 rtc.answer
+    let resolveRemote!: () => void
+    const origSetRemote = MockPeerConnection.prototype.setRemoteDescription
+    MockPeerConnection.prototype.setRemoteDescription = () =>
+      new Promise<void>((resolve) => {
+        resolveRemote = resolve
+      })
+
+    try {
+      await mgr.handleSignal(
+        'peer-a',
+        'Laptop',
+        'file.offer',
+        'tx-dup-offer',
+        { files: [{ name: 'dup.bin', size: 4, mime: 'application/octet-stream' }] },
+        true
+      )
+
+      const firstOfferPromise = mgr.handleSignal('peer-a', 'Laptop', 'rtc.offer', 'tx-dup-offer', {
+        type: 'offer',
+        sdp: 'v=0-1'
+      })
+      const dupOfferDuringHandshake = mgr.handleSignal('peer-a', 'Laptop', 'rtc.offer', 'tx-dup-offer', {
+        type: 'offer',
+        sdp: 'v=0-2'
+      })
+
+      expect(MockPeerConnection.instances).toHaveLength(1)
+      resolveRemote()
+      await Promise.all([firstOfferPromise, dupOfferDuringHandshake])
+
+      // 协商完成且已有 PC 时再来重复 offer 同样忽略
+      await mgr.handleSignal('peer-a', 'Laptop', 'rtc.offer', 'tx-dup-offer', {
+        type: 'offer',
+        sdp: 'v=0-3'
+      })
+      expect(MockPeerConnection.instances).toHaveLength(1)
+      expect(signals.filter((s) => s.type === 'rtc.answer' && s.id === 'tx-dup-offer')).toHaveLength(1)
+    } finally {
+      MockPeerConnection.prototype.setRemoteDescription = origSetRemote
+    }
+
+    // 2. setLocalDescription 异步等待期间取消传输，不应再发送 rtc.offer / rtc.answer
+    let resolveLocalSender!: () => void
+    const origSetLocal = MockPeerConnection.prototype.setLocalDescription
+    MockPeerConnection.prototype.setLocalDescription = () =>
+      new Promise<void>((resolve) => {
+        resolveLocalSender = resolve
+      })
+
+    try {
+      const f = new File([new Uint8Array([1, 2])], 'cancel.bin')
+      const txSend = mgr.startOutgoing('peer-b', 'Phone', [f])
+      const acceptPromise = mgr.handleSignal('peer-b', 'Phone', 'file.accept', txSend.transferId, {})
+      await vi.advanceTimersByTimeAsync(0)
+      mgr.cancelTransfer(txSend.transferId)
+      resolveLocalSender()
+      await acceptPromise
+      expect(signals.some((s) => s.type === 'rtc.offer' && s.id === txSend.transferId)).toBe(false)
+
+      let resolveLocalReceiver!: () => void
+      MockPeerConnection.prototype.setLocalDescription = () =>
+        new Promise<void>((resolve) => {
+          resolveLocalReceiver = resolve
+        })
+      await mgr.handleSignal(
+        'peer-a',
+        'Laptop',
+        'file.offer',
+        'tx-rx-abort',
+        { files: [{ name: 'abort.bin', size: 4, mime: 'application/octet-stream' }] },
+        true
+      )
+      const rxOfferPromise = mgr.handleSignal('peer-a', 'Laptop', 'rtc.offer', 'tx-rx-abort', {
+        type: 'offer',
+        sdp: 'v=0-rx'
+      })
+      await vi.advanceTimersByTimeAsync(0)
+      mgr.cancelTransfer('tx-rx-abort')
+      resolveLocalReceiver()
+      await rxOfferPromise
+      expect(signals.some((s) => s.type === 'rtc.answer' && s.id === 'tx-rx-abort')).toBe(false)
+    } finally {
+      MockPeerConnection.prototype.setLocalDescription = origSetLocal
+    }
+  })
+
+  it('ignores relay.start while pending and validates blank transferId, malformed answer SDP and offered metadata sizes', async () => {
+    const fetcher = vi.fn().mockResolvedValue(new Response(new Uint8Array([1, 2, 3]), { status: 200 }))
+    const rxUpdates: TransferTask[] = []
+    const rxMgr = new TransferManager({
+      sendSignal: vi.fn(),
+      getSessionToken: () => 'tok-guard',
+      getIceServers: () => [],
+      getMaxRelayMB: () => 50,
+      onUpdate: (t) => rxUpdates.push(t),
+      fetcher
+    })
+
+    // 1. 空白 transferId 应直接忽略
+    await rxMgr.handleSignal('peer-a', 'Laptop', 'file.offer', '   ', {
+      files: [{ name: 'ignored.bin', size: 3, mime: 'application/octet-stream' }]
+    })
+    expect(rxUpdates).toHaveLength(0)
+
+    // 2. pending 状态收到 relay.start 不得触发中转下载
+    await rxMgr.handleSignal('peer-a', 'Laptop', 'file.offer', 'tx-pending-relay', {
+      files: [{ name: 'secret.bin', size: 3, mime: 'application/octet-stream' }]
+    })
+    expect(rxUpdates.at(-1)?.state).toBe('pending')
+
+    await rxMgr.handleSignal('peer-a', 'Laptop', 'relay.start', 'tx-pending-relay', {})
+    expect(fetcher).not.toHaveBeenCalled()
+    expect(rxUpdates.at(-1)?.state).toBe('pending')
+    expect(rxUpdates.at(-1)?.channel).toBe('webrtc')
+
+    // 3. file.start 声明的 size 与 file.offer 不一致时快速失败
+    rxMgr.acceptIncoming('tx-pending-relay')
+    await rxMgr.handleSignal('peer-a', 'Laptop', 'rtc.offer', 'tx-pending-relay', { type: 'offer', sdp: 'v=0' })
+    const rxPc = MockPeerConnection.instances.at(-1)!
+    const rxDc = new MockDataChannel()
+    rxPc.triggerDataChannel(rxDc)
+    rxDc.onmessage?.({
+      data: JSON.stringify({
+        type: 'file.start',
+        transferId: 'tx-pending-relay',
+        fileIndex: 0,
+        name: 'secret.bin',
+        size: 999,
+        mime: 'application/octet-stream'
+      })
+    })
+    await vi.advanceTimersByTimeAsync(10)
+    expect(rxUpdates.at(-1)?.state).toBe('failed')
+    expect(rxUpdates.at(-1)?.errorMessage).toContain('size mismatch')
+
+    // 3b. file.end 声明的 totalBytes 与 file.offer 不一致时快速失败
+    await rxMgr.handleSignal(
+      'peer-a',
+      'Laptop',
+      'file.offer',
+      'tx-end-mismatch',
+      { files: [{ name: 'endbad.bin', size: 3, mime: 'application/octet-stream' }] },
+      true
+    )
+    await rxMgr.handleSignal('peer-a', 'Laptop', 'rtc.offer', 'tx-end-mismatch', { type: 'offer', sdp: 'v=0' })
+    const rxPc2 = MockPeerConnection.instances.at(-1)!
+    const rxDc2 = new MockDataChannel()
+    rxPc2.triggerDataChannel(rxDc2)
+    rxDc2.onmessage?.({
+      data: JSON.stringify({
+        type: 'file.start',
+        transferId: 'tx-end-mismatch',
+        fileIndex: 0,
+        name: 'endbad.bin',
+        size: 3,
+        mime: 'application/octet-stream'
+      })
+    })
+    rxDc2.onmessage?.({ data: new Uint8Array([1, 2]).buffer })
+    rxDc2.onmessage?.({
+      data: JSON.stringify({
+        type: 'file.end',
+        transferId: 'tx-end-mismatch',
+        fileIndex: 0,
+        totalBytes: 2
+      })
+    })
+    await vi.advanceTimersByTimeAsync(10)
+    expect(rxUpdates.at(-1)?.state).toBe('failed')
+    expect(rxUpdates.at(-1)?.errorMessage).toContain('file.end size mismatch')
+
+    // 4. rtc.answer 携带非法 SDP 导致 setRemoteDescription 抛错时应清理 PC 并降级（或按限额失败）而不抛出未捕获异常
+    const origSetRemote = MockPeerConnection.prototype.setRemoteDescription
+    MockPeerConnection.prototype.setRemoteDescription = async () => {
+      throw new Error('InvalidAccessError: malformed SDP')
+    }
+    try {
+      const txUpdates: TransferTask[] = []
+      const txSignals: SignalType[] = []
+      const txMgr = new TransferManager({
+        sendSignal: (_to, type) => txSignals.push(type),
+        getSessionToken: () => 'tok-sdp',
+        getIceServers: () => [],
+        getMaxRelayMB: () => 0,
+        onUpdate: (t) => txUpdates.push(t)
+      })
+      const f = new File([new Uint8Array([1, 2])], 'sdp.bin')
+      const tx = txMgr.startOutgoing('peer-b', 'Phone', [f])
+      await txMgr.handleSignal('peer-b', 'Phone', 'file.accept', tx.transferId, {})
+      const txPc = MockPeerConnection.instances.at(-1)!
+      await txMgr.handleSignal('peer-b', 'Phone', 'rtc.ice', tx.transferId, {
+        candidate: 'candidate:1 1 udp 1 127.0.0.1 5000 typ host'
+      })
+      await txMgr.handleSignal('peer-b', 'Phone', 'rtc.answer', tx.transferId, { type: 'answer', sdp: 'bad-sdp' })
+      expect(txPc.closed).toBe(true)
+      expect(txPc.addedIceCandidates).toHaveLength(0)
+      expect(txUpdates.at(-1)?.state).toBe('failed')
+      expect(txSignals).not.toContain('relay.start')
+    } finally {
+      MockPeerConnection.prototype.setRemoteDescription = origSetRemote
+    }
+
+    // 5. !res.body 降级分支在 arrayBuffer() 返回前被取消时应中止写入与完成
+    let resolveArrayBuf!: (buf: ArrayBuffer) => void
+    const bodylessFetcher = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      body: null,
+      arrayBuffer: () =>
+        new Promise<ArrayBuffer>((resolve) => {
+          resolveArrayBuf = resolve
+        })
+    } as unknown as Response)
+    const abortUpdates: TransferTask[] = []
+    const abortMgr = new TransferManager({
+      sendSignal: vi.fn(),
+      getSessionToken: () => 'tok-ab',
+      getIceServers: () => [],
+      getMaxRelayMB: () => 50,
+      onUpdate: (t) => abortUpdates.push(t),
+      fetcher: bodylessFetcher
+    })
+    await abortMgr.handleSignal(
+      'peer-a',
+      'Laptop',
+      'file.offer',
+      'tx-bodyless-abort',
+      { files: [{ name: 'ab.bin', size: 3, mime: 'application/octet-stream' }] },
+      true
+    )
+    const relayPromise = abortMgr.handleSignal('peer-a', 'Laptop', 'relay.start', 'tx-bodyless-abort', {})
+    await vi.advanceTimersByTimeAsync(0)
+    abortMgr.cancelTransfer('tx-bodyless-abort')
+    resolveArrayBuf(new Uint8Array([1, 2, 3]).buffer)
+    await relayPromise
+    expect(abortUpdates.at(-1)?.state).toBe('cancelled')
+    expect(abortUpdates.at(-1)?.receivedFiles).toHaveLength(0)
   })
 })
