@@ -1,0 +1,7 @@
+.git
+.worktrees
+.superpowers
+.DS_Store
+bin
+web/node_modules
+web/dist

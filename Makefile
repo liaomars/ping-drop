@@ -29,6 +29,7 @@ test: test-web vet test-go
 build-web:
 	pnpm --dir web install --frozen-lockfile || pnpm --dir web install
 	pnpm --dir web build
+	git checkout -- web/dist/.gitkeep 2>/dev/null || touch web/dist/.gitkeep
 
 build: build-web
 	$(DOCKER_RUN) sh -c 'CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/ping-drop ./cmd/ping-drop'
