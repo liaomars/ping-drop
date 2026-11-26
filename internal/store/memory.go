@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -65,6 +67,7 @@ type MemoryStore struct {
 	blobs           map[string]*storedBlob
 	lru             *list.List
 	globalBlobBytes int64
+	pendingExpired  map[string]struct{}
 }
 
 // NewMemoryStore 创建一个配置好配额与淘汰策略的 MemoryStore。
@@ -94,6 +97,7 @@ func NewMemoryStore(cfg Config) *MemoryStore {
 		spaceBlobBytes:     make(map[string]int64),
 		blobs:              make(map[string]*storedBlob),
 		lru:                list.New(),
+		pendingExpired:     make(map[string]struct{}),
 	}
 }
 
@@ -103,8 +107,9 @@ func (s *MemoryStore) AddText(spaceID, senderID, senderName, text string) protoc
 	defer s.mu.Unlock()
 
 	now := s.now()
-	s.purgeExpiredLocked(now)
+	s.purgeSpaceExpiredLocked(spaceID, now)
 
+	expiresAt := time.UnixMilli(now.Add(s.ttl).UnixMilli())
 	item := protocol.TimelineItem{
 		ID:         randomHex16(),
 		Kind:       protocol.ItemKindText,
@@ -112,7 +117,7 @@ func (s *MemoryStore) AddText(spaceID, senderID, senderName, text string) protoc
 		SenderName: senderName,
 		Text:       text,
 		CreatedAt:  now.UnixMilli(),
-		ExpiresAt:  now.Add(s.ttl).UnixMilli(),
+		ExpiresAt:  expiresAt.UnixMilli(),
 	}
 	s.appendItemLocked(spaceID, item)
 	return item
@@ -125,7 +130,7 @@ func (s *MemoryStore) AddBlob(spaceID, senderID, senderName string, kind protoco
 	defer s.mu.Unlock()
 
 	now := s.now()
-	s.purgeExpiredLocked(now)
+	s.purgeSpaceExpiredLocked(spaceID, now)
 
 	if size > s.maxSpaceBlobBytes {
 		return protocol.TimelineItem{}, ErrSpaceQuotaExceeded
@@ -141,7 +146,10 @@ func (s *MemoryStore) AddBlob(spaceID, senderID, senderName string, kind protoco
 		}
 	}
 
-	// 再满足全局内存池上限，按最旧全局 LRU 依次淘汰
+	// 若全局内存池不足，先清理其他空间的过期条目，再按全局 LRU 依次淘汰
+	if s.globalBlobBytes+size > s.maxGlobalBlobBytes {
+		s.purgeAllExpiredLocked(now)
+	}
 	for s.globalBlobBytes+size > s.maxGlobalBlobBytes {
 		if !s.evictOldestGlobalBlobLocked() {
 			return protocol.TimelineItem{}, ErrGlobalMemoryExceeded
@@ -150,7 +158,7 @@ func (s *MemoryStore) AddBlob(spaceID, senderID, senderName string, kind protoco
 
 	itemID := randomHex16()
 	blobID := randomHex16()
-	expiresAt := now.Add(s.ttl)
+	expiresAt := time.UnixMilli(now.Add(s.ttl).UnixMilli())
 	copied := make([]byte, len(data))
 	copy(copied, data)
 
@@ -254,6 +262,7 @@ func (s *MemoryStore) ClearSpace(spaceID string) {
 	}
 	delete(s.spaces, spaceID)
 	delete(s.spaceBlobBytes, spaceID)
+	delete(s.pendingExpired, spaceID)
 }
 
 // HasLiveItems 判断指定空间是否仍存在未过期条目。
@@ -274,7 +283,18 @@ func (s *MemoryStore) HasLiveItems(spaceID string) bool {
 func (s *MemoryStore) CleanupExpired() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.purgeExpiredLocked(s.now())
+
+	s.purgeAllExpiredLocked(s.now())
+	if len(s.pendingExpired) == 0 {
+		return nil
+	}
+	touched := make([]string, 0, len(s.pendingExpired))
+	for spaceID := range s.pendingExpired {
+		touched = append(touched, spaceID)
+	}
+	clear(s.pendingExpired)
+	slices.Sort(touched)
+	return touched
 }
 
 func (s *MemoryStore) appendItemLocked(spaceID string, item protocol.TimelineItem) {
@@ -355,36 +375,45 @@ func (s *MemoryStore) removeBlobLocked(blobID string) {
 	}
 }
 
-func (s *MemoryStore) purgeExpiredLocked(now time.Time) []string {
-	nowMs := now.UnixMilli()
-	var touched []string
-	for spaceID, items := range s.spaces {
-		kept := items[:0]
-		changed := false
-		for _, it := range items {
-			if it.ExpiresAt <= nowMs {
-				changed = true
-				if it.BlobID != "" {
-					s.removeBlobLocked(it.BlobID)
-				}
-				continue
-			}
-			kept = append(kept, it)
-		}
-		if changed {
-			touched = append(touched, spaceID)
-		}
-		if len(kept) == 0 {
-			delete(s.spaces, spaceID)
-		} else {
-			s.spaces[spaceID] = kept
-		}
+func (s *MemoryStore) purgeSpaceExpiredLocked(spaceID string, now time.Time) bool {
+	items, ok := s.spaces[spaceID]
+	if !ok {
+		return false
 	}
-	return touched
+	nowMs := now.UnixMilli()
+	kept := items[:0]
+	changed := false
+	for _, it := range items {
+		if it.ExpiresAt <= nowMs {
+			changed = true
+			if it.BlobID != "" {
+				s.removeBlobLocked(it.BlobID)
+			}
+			continue
+		}
+		kept = append(kept, it)
+	}
+	if len(kept) == 0 {
+		delete(s.spaces, spaceID)
+	} else {
+		s.spaces[spaceID] = kept
+	}
+	if changed {
+		s.pendingExpired[spaceID] = struct{}{}
+	}
+	return changed
+}
+
+func (s *MemoryStore) purgeAllExpiredLocked(now time.Time) {
+	for spaceID := range s.spaces {
+		s.purgeSpaceExpiredLocked(spaceID, now)
+	}
 }
 
 func randomHex16() string {
 	var b [16]byte
-	_, _ = rand.Read(b[:])
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(fmt.Sprintf("store: crypto/rand.Read failed: %v", err))
+	}
 	return hex.EncodeToString(b[:])
 }
