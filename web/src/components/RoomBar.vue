@@ -31,8 +31,8 @@ watch(
   () => [props.space.code, props.roomModalOpen] as const,
   async ([code, open]) => {
     const seq = ++qrSeq
+    qrDataUrl.value = ''
     if (!open || !code) {
-      qrDataUrl.value = ''
       return
     }
     const shareUrl = `${window.location.origin}/?room=${code}`

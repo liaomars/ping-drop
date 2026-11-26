@@ -55,7 +55,7 @@ function onMobilePickFiles(ev: Event): void {
   input.value = ''
 }
 
-function onGlobalDrop(ev: DragEvent): void {
+async function onGlobalDrop(ev: DragEvent): Promise<void> {
   ev.preventDefault()
   const files = Array.from(ev.dataTransfer?.files ?? [])
   if (files.length === 0) return
@@ -74,8 +74,8 @@ function onGlobalDrop(ev: DragEvent): void {
   const eligible = files.filter((file) => file.size <= maxBytes)
   const hasOversized = files.some((file) => file.size > maxBytes)
 
-  for (const file of eligible) {
-    void store.uploadTimelineFile(file)
+  if (eligible.length > 0) {
+    await Promise.all(eligible.map((f) => store.uploadTimelineFile(f)))
   }
 
   if (hasOversized) {
@@ -166,6 +166,7 @@ function onGlobalDrop(ev: DragEvent): void {
           />
           <DirectPanel
             v-if="selectedPeer"
+            :key="selectedPeer.id"
             :peer="selectedPeer"
             :messages="state.dmsByPeer[selectedPeer.id] ?? []"
             @close="store.selectPeer(null)"

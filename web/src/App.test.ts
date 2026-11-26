@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { reactive } from 'vue'
-import { mount } from '@vue/test-utils'
+import { flushPromises, mount } from '@vue/test-utils'
 import App from './App.vue'
 import type { SessionState } from './stores/session'
 
@@ -166,5 +166,61 @@ describe('App.vue', () => {
     // 切回 radar Tab 时隐藏
     await wrapper.get('[data-testid="tab-radar"]').trigger('click')
     expect(wrapper.find('[data-testid="mobile-quick-bar"]').exists()).toBe(false)
+  })
+
+  it('resets DirectPanel unsent draft when switching selected peer', async () => {
+    activeStore.state.peers.push({
+      id: 'p-peer-2',
+      name: 'iPad',
+      deviceType: 'mobile',
+      os: 'iPadOS',
+      browser: 'Safari'
+    })
+    activeStore.state.selectedPeerId = 'p-peer'
+    const wrapper = mount(App)
+
+    const dmInput = wrapper.get('#dm-text-input')
+    await dmInput.setValue('unsent draft')
+    expect((dmInput.element as HTMLInputElement).value).toBe('unsent draft')
+
+    activeStore.state.selectedPeerId = 'p-peer-2'
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get('[data-testid="direct-panel"]').text()).toContain('iPad')
+    expect((wrapper.get('#dm-text-input').element as HTMLInputElement).value).toBe('')
+  })
+
+  it('awaits eligible timeline uploads before showing oversized file toast on mixed global drop', async () => {
+    activeStore.state.space = { kind: 'room', code: '123456', sharedTimelineEnabled: true }
+    let resolveUpload!: (ok: boolean) => void
+    activeStore.uploadTimelineFile.mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveUpload = (ok: boolean) => {
+            activeStore.showToast('已添加到共享时间线', 'success')
+            resolve(ok)
+          }
+        })
+    )
+
+    const wrapper = mount(App)
+    const root = wrapper.get('[data-testid="app-root"]')
+    const smallFile = new File(['abc'], 'small.txt', { type: 'text/plain' })
+    const bigFile = new File([new Uint8Array(21 * 1024 * 1024)], 'big.zip', { type: 'application/zip' })
+
+    await root.trigger('drop', makeDropPayload([smallFile, bigFile]))
+    expect(activeStore.uploadTimelineFile).toHaveBeenCalledTimes(1)
+    expect(activeStore.uploadTimelineFile).toHaveBeenCalledWith(smallFile)
+    expect(activeStore.showToast).not.toHaveBeenCalled()
+
+    resolveUpload(true)
+    await flushPromises()
+
+    expect(activeStore.showToast).toHaveBeenCalledTimes(2)
+    expect(activeStore.showToast.mock.calls[0]).toEqual(['已添加到共享时间线', 'success'])
+    expect(activeStore.showToast.mock.calls[1]).toEqual([
+      expect.stringContaining('超出时间线'),
+      'error'
+    ])
   })
 })

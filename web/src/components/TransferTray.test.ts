@@ -38,6 +38,7 @@ describe('TransferTray.vue', () => {
 
     expect(wrapper.text()).toContain('服务器中转')
     expect(wrapper.text()).toContain('OPFS')
+    expect(wrapper.find('[data-testid="memory-warning-tx-1-0"]').exists()).toBe(false)
     const saveBtn = wrapper.get('[data-testid="save-file-0"]')
     expect(saveBtn.text()).toContain('保存 / 重新下载')
     await saveBtn.trigger('click')
@@ -49,7 +50,7 @@ describe('TransferTray.vue', () => {
     expect(wrapper.emitted('dismiss')?.[0]).toEqual(['tx-1'])
   })
 
-  it('shows P2P badge, memory storage mode, and large-file memory warning only when memory fallback is used for large files', async () => {
+  it('shows P2P badge, memory storage mode, and memory warning whenever storageMode is memory regardless of size, while omitting it for opfs', async () => {
     const largeBytes = 25 * 1024 * 1024
     const wrapper = mount(TransferTray, {
       props: {
@@ -57,7 +58,7 @@ describe('TransferTray.vue', () => {
         autoAcceptInRoom: false,
         transfers: [
           {
-            transferId: 'tx-mem-large',
+            transferId: 'tx-opfs-large',
             direction: 'receive',
             peerId: 'p2',
             peerName: 'iPhone',
@@ -74,8 +75,8 @@ describe('TransferTray.vue', () => {
                 name: 'archive.zip',
                 size: largeBytes,
                 mime: 'application/zip',
-                objectUrl: 'blob:mem-large',
-                storageMode: 'memory'
+                objectUrl: 'blob:opfs-large',
+                storageMode: 'opfs'
               }
             ]
           },
@@ -108,8 +109,11 @@ describe('TransferTray.vue', () => {
 
     expect(wrapper.text()).toContain('P2P 直连')
     expect(wrapper.text()).toContain('内存')
-    expect(wrapper.find('[data-testid="memory-warning-tx-mem-large-0"]').exists()).toBe(true)
-    expect(wrapper.find('[data-testid="memory-warning-tx-mem-small-0"]').exists()).toBe(false)
+    expect(wrapper.text()).toContain('OPFS')
+    expect(wrapper.find('[data-testid="memory-warning-tx-opfs-large-0"]').exists()).toBe(false)
+    const memWarning = wrapper.find('[data-testid="memory-warning-tx-mem-small-0"]')
+    expect(memWarning.exists()).toBe(true)
+    expect(memWarning.text()).toContain('不支持 OPFS')
   })
 
   it('supports accept, reject, cancel and autoAcceptInRoom toggle', async () => {

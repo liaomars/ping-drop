@@ -1,8 +1,6 @@
 <script setup lang="ts">
-import type { ReceivedFileRecord, TransferTask } from '../lib/rtcTransfer'
+import type { TransferTask } from '../lib/rtcTransfer'
 import { formatBytes } from '../lib/device'
-
-const LARGE_MEMORY_FILE_BYTES = 20 * 1024 * 1024
 
 defineProps<{
   transfers: TransferTask[]
@@ -23,10 +21,6 @@ const emit = defineEmits<{
 function progressPct(task: TransferTask): number {
   if (task.totalBytes <= 0) return 0
   return Math.min(100, Math.round((task.bytesTransferred / task.totalBytes) * 100))
-}
-
-function isLargeMemoryFile(rec: ReceivedFileRecord): boolean {
-  return rec.storageMode === 'memory' && rec.size >= LARGE_MEMORY_FILE_BYTES
 }
 </script>
 
@@ -152,11 +146,11 @@ function isLargeMemoryFile(rec: ReceivedFileRecord): boolean {
             </button>
           </div>
           <p
-            v-if="isLargeMemoryFile(rec)"
+            v-if="rec.storageMode === 'memory'"
             :data-testid="`memory-warning-${task.transferId}-${idx}`"
             class="text-[11px] text-amber-300"
           >
-            当前文件通过内存暂存（当前环境不支持 OPFS），体积较大，请立即保存并避免刷新页面
+            当前环境不支持 OPFS，文件暂存于内存，请及时保存且勿刷新页面
           </p>
         </div>
       </div>
