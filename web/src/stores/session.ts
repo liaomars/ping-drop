@@ -65,6 +65,8 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
   let toastSeq = 0
   let toastTimer: ReturnType<typeof setTimeout> | null = null
   let destroyed = false
+  let hasInitialSpace = false
+  let spaceEpoch = 0
 
   const state = reactive<SessionState>({
     wsStatus: 'closed',
@@ -86,6 +88,7 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
 
   /** 显示短时 Toast 提示并在 3.2 秒后自动清除 */
   function showToast(message: string, kind: ToastNotice['kind'] = 'info'): void {
+    if (destroyed) return
     toastSeq += 1
     state.toast = { id: toastSeq, kind, message }
     if (toastTimer !== null) clearTimeout(toastTimer)
@@ -130,6 +133,7 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
     getMaxRelayMB: () => state.limits.maxRelayMB,
     fetcher,
     onUpdate: (task) => {
+      if (destroyed) return
       const idx = state.transfers.findIndex((t) => t.transferId === task.transferId)
       if (idx === -1) {
         state.transfers.unshift(task)
@@ -150,8 +154,8 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
     destroyed = true
     ws.close()
     transfers.disposeAll()
-    blobCache.clear()
-    state.blobPreviewUrls = {}
+    state.transfers = []
+    clearPreviewUrls()
     if (toastTimer !== null) {
       clearTimeout(toastTimer)
       toastTimer = null
@@ -165,6 +169,7 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
 
   function ensurePreviewUrls(items: TimelineItem[]): void {
     if (!state.sessionToken || destroyed) return
+    const epoch = spaceEpoch
     for (const item of items) {
       if (item.kind === 'image' && item.blobId && !state.blobPreviewUrls[item.blobId]) {
         const blobId = item.blobId
@@ -172,7 +177,11 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
         void blobCache
           .fetchObjectUrl(blobId, state.sessionToken, false)
           .then((url) => {
-            if (!destroyed && state.timeline.some((x) => x.id === itemId && x.blobId === blobId)) {
+            if (
+              !destroyed &&
+              epoch === spaceEpoch &&
+              state.timeline.some((x) => x.id === itemId && x.blobId === blobId)
+            ) {
               state.blobPreviewUrls[blobId] = url
             } else {
               blobCache.revoke(blobId)
@@ -185,6 +194,7 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
 
   /** 分发并处理来自服务端的 WebSocket 业务事件 */
   function handleServerEvent(type: string, payload: unknown): void {
+    if (destroyed) return
     switch (type) {
       case 'welcome': {
         const p = payload as WelcomePayload
@@ -196,6 +206,16 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
       }
       case 'space.state': {
         const p = payload as SpaceStatePayload
+        const spaceChanged =
+          hasInitialSpace &&
+          (state.space.kind !== p.space.kind || (state.space.code ?? '') !== (p.space.code ?? ''))
+        hasInitialSpace = true
+        if (spaceChanged) {
+          spaceEpoch += 1
+          transfers.disposeAll()
+          state.transfers = []
+          state.dmsByPeer = {}
+        }
         clearPreviewUrls()
         state.space = p.space
         state.peers = p.peers ?? []
@@ -267,15 +287,24 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
       case 'rtc.signal': {
         const sig = payload as RTCSignalEventPayload
         const fromPeer = state.peers.find((x) => x.id === sig.fromPeerId)
-        const auto = state.space.kind === 'room' && state.autoAcceptInRoom
-        void transfers.handleSignal(
-          sig.fromPeerId,
-          fromPeer?.name ?? '对端设备',
-          sig.signalType,
-          sig.transferId,
-          sig.data,
-          auto
-        )
+        const shouldAutoAccept =
+          state.space.kind === 'room' && state.autoAcceptInRoom && sig.signalType === 'file.offer'
+        const epoch = spaceEpoch
+        void transfers
+          .handleSignal(
+            sig.fromPeerId,
+            fromPeer?.name ?? '对端设备',
+            sig.signalType,
+            sig.transferId,
+            sig.data,
+            false
+          )
+          .then(() => {
+            if (shouldAutoAccept && !destroyed && epoch === spaceEpoch) {
+              return acceptIncoming(sig.transferId)
+            }
+          })
+          .catch(() => undefined)
         break
       }
       case 'error': {
@@ -337,6 +366,7 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
 
   /** 上传图片或小文件至当前空间的共享时间线 */
   async function uploadTimelineFile(file: File): Promise<boolean> {
+    if (destroyed) return false
     if (!state.space.sharedTimelineEnabled) {
       showToast('当前局域网默认关闭共享时间线，请开启 6 位码房间', 'error')
       return false
@@ -347,24 +377,34 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
       return false
     }
 
+    const epoch = spaceEpoch
     const fd = new FormData()
     fd.append('file', file)
-    const res = await fetcher('/api/blobs', {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${state.sessionToken}` },
-      body: fd
-    })
-    if (!res.ok) {
-      showToast('上传至时间线失败', 'error')
+    try {
+      const res = await fetcher('/api/blobs', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${state.sessionToken}` },
+        body: fd
+      })
+      if (destroyed || epoch !== spaceEpoch) return false
+      if (!res.ok) {
+        showToast('上传至时间线失败', 'error')
+        return false
+      }
+      const data = (await res.json()) as { item?: TimelineItem } | null
+      if (destroyed || epoch !== spaceEpoch) return false
+      if (data?.item && !state.timeline.some((x) => x.id === data.item?.id)) {
+        state.timeline.push(data.item)
+        ensurePreviewUrls([data.item])
+      }
+      showToast('已添加到共享时间线', 'success')
+      return true
+    } catch {
+      if (!destroyed && epoch === spaceEpoch) {
+        showToast('上传至时间线失败', 'error')
+      }
       return false
     }
-    const data = (await res.json()) as { item?: TimelineItem }
-    if (data.item && !state.timeline.some((x) => x.id === data.item?.id)) {
-      state.timeline.push(data.item)
-      ensurePreviewUrls([data.item])
-    }
-    showToast('已添加到共享时间线', 'success')
-    return true
   }
 
   /** 删除指定共享时间线条目 */
@@ -379,11 +419,17 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
 
   /** 通过鉴权 Blob 接口下载时间线文件并触发浏览器保存 */
   async function downloadTimelineBlob(item: TimelineItem): Promise<void> {
-    if (!item.blobId) return
+    if (!item.blobId || destroyed) return
+    const epoch = spaceEpoch
     try {
       const url = await blobCache.fetchObjectUrl(item.blobId, state.sessionToken, true)
+      if (destroyed || epoch !== spaceEpoch || !state.timeline.some((x) => x.id === item.id)) {
+        blobCache.revoke(item.blobId)
+        return
+      }
       triggerBrowserDownload(url, item.fileName ?? 'download.bin')
     } catch {
+      if (destroyed || epoch !== spaceEpoch) return
       showToast('文件已过期或无权限下载', 'error')
     }
   }
@@ -416,9 +462,12 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
 
   /** 接收文件前校验浏览器存储配额，空间不足时弹出警告后再继续接收 */
   async function acceptIncoming(transferId: string): Promise<void> {
+    if (destroyed) return
+    const epoch = spaceEpoch
     const task = state.transfers.find((t) => t.transferId === transferId)
     if (task) {
       const quota = await checkStorageQuota(task.totalBytes)
+      if (destroyed || epoch !== spaceEpoch) return
       if (!quota.ok) {
         showToast(
           quota.availableBytes !== null
