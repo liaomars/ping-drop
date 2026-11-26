@@ -449,6 +449,18 @@ func (h *Hub) ForwardRTCSignal(peerID string, req protocol.RTCSignalPayload) (st
 	return sender.spaceID, true
 }
 
+// SendPong 向指定在线设备发送应用层心跳响应帧。
+func (h *Hub) SendPong(peerID string) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	p, ok := h.peers[peerID]
+	if !ok {
+		return
+	}
+	h.sendEventLocked(p, protocol.EventPong, struct{}{})
+}
+
 // LookupSession 根据私有 sessionToken 返回设备及其当前空间归属。
 func (h *Hub) LookupSession(sessionToken string) (SessionInfo, bool) {
 	h.mu.RLock()
