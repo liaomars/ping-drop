@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -21,7 +22,6 @@ type SessionLookup interface {
 }
 
 type transferMeta struct {
-	transferID string
 	spaceID    string
 	senderID   string
 	receiverID string
@@ -65,7 +65,6 @@ func (m *RelayManager) RegisterTransfer(transferID, spaceID, senderID, receiverI
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.transfers[transferID] = transferMeta{
-		transferID: transferID,
 		spaceID:    spaceID,
 		senderID:   senderID,
 		receiverID: receiverID,
@@ -109,6 +108,11 @@ func (m *RelayManager) CancelPeerTransfers(peerID string) {
 
 // HandleUpload 处理发送方流式上传请求，实时通过 io.Pipe 写入接收方通道。
 func (m *RelayManager) HandleUpload(w http.ResponseWriter, r *http.Request, lookup SessionLookup, transferID string, fileIndex int) {
+	sess, ok := authenticateBearer(r, lookup)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	if m.maxRelayBytes <= 0 {
 		http.Error(w, "relay disabled", http.StatusForbidden)
 		return
@@ -118,18 +122,10 @@ func (m *RelayManager) HandleUpload(w http.ResponseWriter, r *http.Request, look
 		return
 	}
 
-	sess, ok := authenticateBearer(r, lookup)
-	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-
-	meta, allowed := m.authorizeParty(lookup, transferID, sess, true)
-	if !allowed {
+	if _, allowed := m.authorizeParty(lookup, transferID, sess, true); !allowed {
 		http.Error(w, "forbidden transfer", http.StatusForbidden)
 		return
 	}
-	_ = meta
 
 	slot, err := m.acquireSlot(transferID, fileIndex, true)
 	if err != nil {
@@ -139,13 +135,24 @@ func (m *RelayManager) HandleUpload(w http.ResponseWriter, r *http.Request, look
 	defer m.releaseSlot(transferID, fileIndex, slot)
 
 	if err := m.waitForPair(r, slot); err != nil {
-		slot.abort(err)
+		m.failSlot(transferID, fileIndex, slot, err)
 		http.Error(w, "relay pair timeout or cancelled", http.StatusRequestTimeout)
 		return
 	}
 
 	limited := http.MaxBytesReader(w, r.Body, m.maxRelayBytes)
+	stop := context.AfterFunc(r.Context(), func() {
+		slot.abort(r.Context().Err())
+	})
 	written, copyErr := io.Copy(slot.pw, limited)
+	stop()
+	if copyErr == nil {
+		select {
+		case <-slot.cancelCh:
+			copyErr = errors.New("relay stream aborted")
+		default:
+		}
+	}
 	if copyErr != nil {
 		_ = slot.pw.CloseWithError(copyErr)
 		var maxErr *http.MaxBytesError
@@ -164,14 +171,13 @@ func (m *RelayManager) HandleUpload(w http.ResponseWriter, r *http.Request, look
 
 // HandleDownload 处理接收方流式下载请求，直接从 io.Pipe 透传至响应流。
 func (m *RelayManager) HandleDownload(w http.ResponseWriter, r *http.Request, lookup SessionLookup, transferID string, fileIndex int) {
-	if m.maxRelayBytes <= 0 {
-		http.Error(w, "relay disabled", http.StatusForbidden)
-		return
-	}
-
 	sess, ok := authenticateBearer(r, lookup)
 	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if m.maxRelayBytes <= 0 {
+		http.Error(w, "relay disabled", http.StatusForbidden)
 		return
 	}
 
@@ -188,7 +194,7 @@ func (m *RelayManager) HandleDownload(w http.ResponseWriter, r *http.Request, lo
 	defer m.releaseSlot(transferID, fileIndex, slot)
 
 	if err := m.waitForPair(r, slot); err != nil {
-		slot.abort(err)
+		m.failSlot(transferID, fileIndex, slot, err)
 		http.Error(w, "relay pair timeout or cancelled", http.StatusRequestTimeout)
 		return
 	}
@@ -199,9 +205,15 @@ func (m *RelayManager) HandleDownload(w http.ResponseWriter, r *http.Request, lo
 	w.Header().Set("Referrer-Policy", "no-referrer")
 	w.WriteHeader(http.StatusOK)
 
-	if _, err := io.Copy(w, slot.pr); err != nil {
-		_ = slot.pr.CloseWithError(err)
-		return
+	stop := context.AfterFunc(r.Context(), func() {
+		slot.abort(r.Context().Err())
+	})
+	_, copyErr := io.Copy(w, slot.pr)
+	stop()
+	if copyErr != nil {
+		_ = slot.pr.CloseWithError(copyErr)
+		// 已发送 200 状态头且无 Content-Length，必须中断传输以避免写出 chunked EOF 导致客户端静默截断。
+		panic(http.ErrAbortHandler)
 	}
 	_ = slot.pr.Close()
 }
@@ -235,6 +247,15 @@ func (m *RelayManager) acquireSlot(transferID string, fileIndex int, isUploader 
 	defer m.mu.Unlock()
 
 	slot, ok := m.slots[key]
+	if ok {
+		select {
+		case <-slot.cancelCh:
+			// 已中止的槽位绝不再参与配对，直接移除并重建新槽位。
+			delete(m.slots, key)
+			ok = false
+		default:
+		}
+	}
 	if !ok {
 		pr, pw := io.Pipe()
 		slot = &streamSlot{
@@ -265,11 +286,22 @@ func (m *RelayManager) acquireSlot(transferID string, fileIndex int, isUploader 
 }
 
 func (m *RelayManager) waitForPair(r *http.Request, slot *streamSlot) error {
+	if err := r.Context().Err(); err != nil {
+		return err
+	}
 	timer := time.NewTimer(m.pairTimeout)
 	defer timer.Stop()
 
 	select {
 	case <-slot.paired:
+		select {
+		case <-slot.cancelCh:
+			return errors.New("relay cancelled")
+		default:
+		}
+		if err := r.Context().Err(); err != nil {
+			return err
+		}
 		return nil
 	case <-slot.cancelCh:
 		return errors.New("relay cancelled")
@@ -278,6 +310,16 @@ func (m *RelayManager) waitForPair(r *http.Request, slot *streamSlot) error {
 	case <-timer.C:
 		return errors.New("relay peer wait timeout")
 	}
+}
+
+func (m *RelayManager) failSlot(transferID string, fileIndex int, slot *streamSlot, err error) {
+	key := slotKey(transferID, fileIndex)
+	m.mu.Lock()
+	if cur, ok := m.slots[key]; ok && cur == slot {
+		delete(m.slots, key)
+	}
+	slot.abort(err)
+	m.mu.Unlock()
 }
 
 func (m *RelayManager) releaseSlot(transferID string, fileIndex int, target *streamSlot) {
