@@ -67,5 +67,12 @@ describe('device utils', () => {
     document.execCommand = execMock
     expect(await copyText('hello')).toBe(true)
     expect(execMock).toHaveBeenCalledWith('copy')
+
+    // execCommand 抛异常时仍应通过 finally 清理临时 textarea
+    document.execCommand = vi.fn(() => {
+      throw new Error('copy blocked')
+    })
+    expect(await copyText('boom')).toBe(false)
+    expect(document.body.querySelectorAll('textarea')).toHaveLength(0)
   })
 })

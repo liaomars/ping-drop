@@ -5,6 +5,7 @@ import {
   MemoryChunkSink,
   OpfsWorkerSink,
   cleanupStaleOpfsTempFiles,
+  removeOpfsTempEntry,
   triggerBrowserDownload
 } from './opfsSink'
 
@@ -120,6 +121,7 @@ describe('opfsSink', () => {
 
     const sink = await createChunkSink('tx/1', 2, 'my file?.bin')
     expect(sink.storageMode).toBe('opfs')
+    expect(sink.tempName).toBe('tx_1-2-my_file_.bin')
     expect(sink).toBeInstanceOf(OpfsWorkerSink)
 
     const worker = MockWorker.instances[0]
@@ -133,6 +135,9 @@ describe('opfsSink', () => {
     expect(url).toBe('blob:chunk-url')
     expect(worker.terminated).toBe(true)
     expect(removeEntry).not.toHaveBeenCalled()
+
+    await removeOpfsTempEntry(sink.tempName!)
+    expect(removeEntry).toHaveBeenCalledWith('tx_1-2-my_file_.bin')
   })
 
   it('removes OPFS temp entry and rejects when finalized size mismatches', async () => {

@@ -59,4 +59,57 @@ describe('BlobUrlCache', () => {
       'blob fetch failed with 403'
     )
   })
+
+  it('rejects inflight fetch, revokes created ObjectURL, and skips caching when revoked or cleared mid-flight', async () => {
+    let seq = 0
+    URL.createObjectURL = vi.fn(() => `blob:race-${++seq}`)
+
+    let resolveReq1!: (res: Response) => void
+    let resolveReq2!: (res: Response) => void
+    let resolveReq3!: (res: Response) => void
+    let resolveReq4!: (res: Response) => void
+
+    const fetcher = vi
+      .fn()
+      .mockImplementationOnce(() => new Promise<Response>((res) => { resolveReq1 = res }))
+      .mockImplementationOnce(() => new Promise<Response>((res) => { resolveReq2 = res }))
+      .mockImplementationOnce(() => new Promise<Response>((res) => { resolveReq3 = res }))
+      .mockImplementationOnce(() => new Promise<Response>((res) => { resolveReq4 = res }))
+
+    const cache = new BlobUrlCache(fetcher)
+
+    // 1. revoke() 发生时老请求仍在途中；紧接着再次请求同一 blobId 不应复用被撤销的 inflight，也不得被老请求 finally 删除
+    const p1 = cache.fetchObjectUrl('blob-race', 'tok-1')
+    cache.revoke('blob-race')
+
+    const p2 = cache.fetchObjectUrl('blob-race', 'tok-1')
+    expect(fetcher).toHaveBeenCalledTimes(2)
+
+    resolveReq1(new Response(new Blob(['stale']), { status: 200 }))
+    await expect(p1).rejects.toThrow()
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:race-1')
+
+    // p1 结束后不得误删 p2 的 inflight 记录：此时再次请求应仍复用 p2，不发第 3 次请求
+    const p2Dedup = cache.fetchObjectUrl('blob-race', 'tok-1')
+    expect(fetcher).toHaveBeenCalledTimes(2)
+
+    // p1 结束后 p2 仍应正常完成并缓存
+    resolveReq2(new Response(new Blob(['fresh']), { status: 200 }))
+    expect(await p2).toBe('blob:race-2')
+    expect(await p2Dedup).toBe('blob:race-2')
+    expect(await cache.fetchObjectUrl('blob-race', 'tok-1')).toBe('blob:race-2')
+    expect(fetcher).toHaveBeenCalledTimes(2)
+
+    // 2. clear() 发生在请求途中：返回后应立即释放 ObjectURL 且不得写入缓存
+    const p3 = cache.fetchObjectUrl('blob-clear', 'tok-1')
+    cache.clear()
+    resolveReq3(new Response(new Blob(['old-space']), { status: 200 }))
+    await expect(p3).rejects.toThrow()
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:race-3')
+
+    const p4 = cache.fetchObjectUrl('blob-clear', 'tok-2')
+    resolveReq4(new Response(new Blob(['new-space']), { status: 200 }))
+    expect(await p4).toBe('blob:race-4')
+    expect(fetcher).toHaveBeenCalledTimes(4)
+  })
 })

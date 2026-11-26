@@ -63,10 +63,13 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
   const fetcher = opts.fetcher ?? (typeof window !== 'undefined' ? fetch.bind(window) : fetch)
   const blobCache = new BlobUrlCache(fetcher)
   let toastSeq = 0
+  let dmLocalSeq = 0
   let toastTimer: ReturnType<typeof setTimeout> | null = null
   let destroyed = false
   let hasInitialSpace = false
+  let hasReceivedWelcome = false
   let spaceEpoch = 0
+  let previewEpoch = 0
 
   const state = reactive<SessionState>({
     wsStatus: 'closed',
@@ -144,9 +147,14 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
   })
 
   /** 清理遗留 OPFS 临时文件并启动 WebSocket 会话连接 */
-  function start(): void {
-    void cleanupStaleOpfsTempFiles()
-    ws.connect()
+  async function start(): Promise<void> {
+    try {
+      await cleanupStaleOpfsTempFiles()
+    } finally {
+      if (!destroyed) {
+        ws.connect()
+      }
+    }
   }
 
   /** 销毁会话、关闭连接并释放所有本地 ObjectURL 与传输资源 */
@@ -163,6 +171,7 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
   }
 
   function clearPreviewUrls(): void {
+    previewEpoch += 1
     blobCache.clear()
     state.blobPreviewUrls = {}
   }
@@ -170,6 +179,7 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
   function ensurePreviewUrls(items: TimelineItem[]): void {
     if (!state.sessionToken || destroyed) return
     const epoch = spaceEpoch
+    const pEpoch = previewEpoch
     for (const item of items) {
       if (item.kind === 'image' && item.blobId && !state.blobPreviewUrls[item.blobId]) {
         const blobId = item.blobId
@@ -180,10 +190,11 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
             if (
               !destroyed &&
               epoch === spaceEpoch &&
+              pEpoch === previewEpoch &&
               state.timeline.some((x) => x.id === itemId && x.blobId === blobId)
             ) {
               state.blobPreviewUrls[blobId] = url
-            } else {
+            } else if (pEpoch === previewEpoch && epoch === spaceEpoch) {
               blobCache.revoke(blobId)
             }
           })
@@ -198,10 +209,16 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
     switch (type) {
       case 'welcome': {
         const p = payload as WelcomePayload
+        const nextPeerId = p.peerId || p.self?.id
+        const isReconnect = hasReceivedWelcome && state.self?.id !== nextPeerId
+        hasReceivedWelcome = true
         state.self = p.self
         state.sessionToken = p.sessionToken
         state.iceServers = p.iceServers ?? []
         state.limits = p.limits ?? state.limits
+        if (isReconnect) {
+          transfers.abortInflightOnReconnect()
+        }
         break
       }
       case 'space.state': {
@@ -244,6 +261,7 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
         if (state.selectedPeerId === peerId) {
           state.selectedPeerId = null
         }
+        transfers.handlePeerLeft(peerId)
         break
       }
       case 'peer.updated': {
@@ -341,7 +359,10 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
       showToast('请输入 6 位数字配对码', 'error')
       return false
     }
-    ws.send('space.join', { kind: 'room', code })
+    if (!ws.send('space.join', { kind: 'room', code })) {
+      showToast('连接已断开，请稍后重试', 'error')
+      return false
+    }
     state.roomModalOpen = false
     return true
   }
@@ -360,7 +381,10 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
       showToast('当前局域网默认关闭共享时间线，请开启 6 位码房间', 'error')
       return false
     }
-    ws.send('timeline.post', { text })
+    if (!ws.send('timeline.post', { text })) {
+      showToast('连接已断开，请稍后重试', 'error')
+      return false
+    }
     return true
   }
 
@@ -429,7 +453,7 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
       }
       triggerBrowserDownload(url, item.fileName ?? 'download.bin')
     } catch {
-      if (destroyed || epoch !== spaceEpoch) return
+      if (destroyed || epoch !== spaceEpoch || !state.timeline.some((x) => x.id === item.id)) return
       showToast('文件已过期或无权限下载', 'error')
     }
   }
@@ -441,7 +465,7 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
     if (ok && state.self) {
       const list = state.dmsByPeer[toPeerId] ?? []
       list.push({
-        id: `local-${Date.now()}`,
+        id: `local-${Date.now()}-${++dmLocalSeq}`,
         fromPeerId: state.self.id,
         fromName: state.self.name,
         text,
@@ -465,17 +489,22 @@ export function createSessionStore(opts: SessionStoreOptions = {}) {
     if (destroyed) return
     const epoch = spaceEpoch
     const task = state.transfers.find((t) => t.transferId === transferId)
-    if (task) {
-      const quota = await checkStorageQuota(task.totalBytes)
-      if (destroyed || epoch !== spaceEpoch) return
-      if (!quota.ok) {
-        showToast(
-          quota.availableBytes !== null
-            ? `浏览器可用存储空间不足（剩余约 ${formatBytes(quota.availableBytes)}），可能无法完整保存文件`
-            : '浏览器可用存储空间不足，可能无法完整保存文件',
-          'error'
-        )
-      }
+    if (!task || task.direction !== 'receive' || task.state !== 'pending') {
+      return
+    }
+    const quota = await checkStorageQuota(task.totalBytes)
+    if (destroyed || epoch !== spaceEpoch) return
+    const latest = state.transfers.find((t) => t.transferId === transferId)
+    if (!latest || latest.direction !== 'receive' || latest.state !== 'pending') {
+      return
+    }
+    if (!quota.ok) {
+      showToast(
+        quota.availableBytes !== null
+          ? `浏览器可用存储空间不足（剩余约 ${formatBytes(quota.availableBytes)}），可能无法完整保存文件`
+          : '浏览器可用存储空间不足，可能无法完整保存文件',
+        'error'
+      )
     }
     transfers.acceptIncoming(transferId)
   }

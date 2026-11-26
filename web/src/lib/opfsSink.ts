@@ -12,6 +12,7 @@ interface WorkerReply {
 /** 大文件分片写入接收槽统一抽象 */
 export interface ChunkSink {
   readonly storageMode: 'opfs' | 'memory'
+  readonly tempName?: string
   write(chunk: Uint8Array): Promise<void>
   finalize(mime: string, expectedSize: number): Promise<string>
   abort(): Promise<void>
@@ -52,8 +53,8 @@ export class MemoryChunkSink implements ChunkSink {
 /** 基于 Web Worker + OPFS FileSystemSyncAccessHandle 的零 OOM 流式落盘接收器 */
 export class OpfsWorkerSink implements ChunkSink {
   readonly storageMode = 'opfs' as const
+  readonly tempName: string
   private readonly worker: Worker
-  private readonly tempName: string
   private seq = 0
   private total = 0
   private closed = false
@@ -212,7 +213,9 @@ export function triggerBrowserDownload(objectUrl: string, fileName: string): voi
   document.body.removeChild(a)
 }
 
-async function removeOpfsTempEntry(tempName: string): Promise<void> {
+/** 删除指定的 OPFS 临时落盘文件（静默忽略无痕模式或不存在的情况） */
+export async function removeOpfsTempEntry(tempName: string): Promise<void> {
+  if (!tempName) return
   try {
     const root = await navigator.storage?.getDirectory?.()
     if (!root) return

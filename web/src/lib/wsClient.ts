@@ -30,7 +30,11 @@ export class WsClient {
   private backoffIndex = 0
   private manuallyClosed = false
   private readonly visibilityHandler = (): void => {
-    if (document.visibilityState === 'visible' && !this.manuallyClosed && (!this.ws || this.ws.readyState !== 1)) {
+    if (
+      document.visibilityState === 'visible' &&
+      !this.manuallyClosed &&
+      (!this.ws || (this.ws.readyState !== 0 && this.ws.readyState !== 1))
+    ) {
       this.clearReconnectTimer()
       this.backoffIndex = 0
       this.openSocket()
@@ -46,6 +50,7 @@ export class WsClient {
   /** 启动连接并监听浏览器可见性变化 */
   connect(): void {
     this.manuallyClosed = false
+    this.backoffIndex = 0
     this.clearReconnectTimer()
     if (typeof document !== 'undefined') {
       document.removeEventListener('visibilitychange', this.visibilityHandler)

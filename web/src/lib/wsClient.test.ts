@@ -183,4 +183,40 @@ describe('WsClient', () => {
     document.dispatchEvent(new Event('visibilitychange'))
     expect(MockSocket.instances).toHaveLength(4)
   })
+
+  it('does not interrupt CONNECTING socket on visibilitychange and resets backoff on explicit connect()', () => {
+    const client = new WsClient({
+      url: 'ws://localhost/ws',
+      getHello: () => ({ deviceType: 'desktop', os: 'macOS', browser: 'Chrome' }),
+      onEvent: vi.fn(),
+      WebSocketImpl: MockSocket as unknown as typeof WebSocket
+    })
+
+    // 1. 建连处于 CONNECTING (readyState === 0) 时切回前台不应关闭并重建连接
+    client.connect()
+    expect(MockSocket.instances).toHaveLength(1)
+    expect(MockSocket.instances[0].readyState).toBe(0)
+
+    setVisibility('visible')
+    document.dispatchEvent(new Event('visibilitychange'))
+    expect(MockSocket.instances).toHaveLength(1)
+
+    // 2. 退避升级后再次手动 connect()，backoffIndex 应重置为 0（下次断线等待 1000ms）
+    MockSocket.instances[0].close()
+    vi.advanceTimersByTime(1_000)
+    expect(MockSocket.instances).toHaveLength(2)
+    MockSocket.instances[1].close()
+    vi.advanceTimersByTime(2_000)
+    expect(MockSocket.instances).toHaveLength(3)
+    MockSocket.instances[2].close()
+
+    client.connect()
+    expect(MockSocket.instances).toHaveLength(4)
+    MockSocket.instances[3].close()
+    vi.advanceTimersByTime(999)
+    expect(MockSocket.instances).toHaveLength(4)
+    vi.advanceTimersByTime(1)
+    expect(MockSocket.instances).toHaveLength(5)
+    client.close()
+  })
 })

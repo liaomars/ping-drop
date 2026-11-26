@@ -73,7 +73,9 @@ func TestHub_RoomLifecycleGraceAndRateLimit(t *testing.T) {
 	_ = drainEvents(c1.SendCh)
 
 	// 创建第 1 个房间成功
-	hub.CreateRoom(c1.PeerID)
+	if switched := hub.CreateRoom(c1.PeerID); !switched {
+		t.Fatal("expected CreateRoom to return true on success")
+	}
 	evs := drainEvents(c1.SendCh)
 	var state protocol.SpaceStatePayload
 	for _, e := range evs {
@@ -87,7 +89,9 @@ func TestHub_RoomLifecycleGraceAndRateLimit(t *testing.T) {
 	}
 
 	// 创建第 2 个房间成功（此时全局房间数达到 MaxRooms=2），第 3 次触发单 IP 建房限流（RateLimitPerMin=2）
-	hub.CreateRoom(c1.PeerID)
+	if switched := hub.CreateRoom(c1.PeerID); !switched {
+		t.Fatal("expected 2nd CreateRoom to return true")
+	}
 	evsSecond := drainEvents(c1.SendCh)
 	var state2 protocol.SpaceStatePayload
 	for _, e := range evsSecond {
@@ -99,23 +103,32 @@ func TestHub_RoomLifecycleGraceAndRateLimit(t *testing.T) {
 		t.Fatalf("expected second distinct 6-digit code, got %q", state2.Space.Code)
 	}
 
-	hub.CreateRoom(c1.PeerID)
+	if switched := hub.CreateRoom(c1.PeerID); switched {
+		t.Fatal("expected rate-limited CreateRoom to return false")
+	}
 	if code, ok := findErrorCode(drainEvents(c1.SendCh)); !ok || code != protocol.ErrRateLimited {
 		t.Fatalf("expected %s on 3rd room creation, got (%q, %v)", protocol.ErrRateLimited, code, ok)
 	}
 
-	// 其他 IP 在全局房间数已满时建房应返回 ROOM_LIMIT_REACHED
+	// 其他 IP 在全局房间数已满时建房应返回 ROOM_LIMIT_REACHED 且返回 false
 	otherIP := hub.Register(netip.MustParseAddr("198.51.100.99"), protocol.HelloPayload{OS: "Linux", Browser: "Chrome"})
 	_ = drainEvents(otherIP.SendCh)
-	hub.CreateRoom(otherIP.PeerID)
+	if switched := hub.CreateRoom(otherIP.PeerID); switched {
+		t.Fatal("expected MaxRooms-limited CreateRoom to return false")
+	}
 	if code, ok := findErrorCode(drainEvents(otherIP.SendCh)); !ok || code != protocol.ErrRoomLimitReached {
 		t.Fatalf("expected %s when MaxRooms reached, got (%q, %v)", protocol.ErrRoomLimitReached, code, ok)
 	}
 	hub.Unregister(otherIP.PeerID)
 
-	// c1 回到第 1 个房间，验证单空间互斥：同局域网 c2 不应看到 c1
-	hub.JoinSpace(c1.PeerID, protocol.SpaceJoinPayload{Kind: protocol.SpaceKindRoom, Code: roomCode})
+	// c1 回到第 1 个房间，重复加入当前同一房间应返回 false，真正切回不同空间才返回 true
+	if switched := hub.JoinSpace(c1.PeerID, protocol.SpaceJoinPayload{Kind: protocol.SpaceKindRoom, Code: roomCode}); !switched {
+		t.Fatal("expected JoinSpace to different room to return true")
+	}
 	_ = drainEvents(c1.SendCh)
+	if switched := hub.JoinSpace(c1.PeerID, protocol.SpaceJoinPayload{Kind: protocol.SpaceKindRoom, Code: roomCode}); switched {
+		t.Fatal("expected JoinSpace to current room to return false")
+	}
 
 	c2 := hub.Register(netip.MustParseAddr("203.0.113.10"), protocol.HelloPayload{OS: "iOS", Browser: "Safari"})
 	c2StateRaw := drainEvents(c2.SendCh)
@@ -128,19 +141,28 @@ func TestHub_RoomLifecycleGraceAndRateLimit(t *testing.T) {
 	if len(c2State.Peers) != 1 || c2State.Peers[0].ID != c2.PeerID {
 		t.Fatalf("expected only c2 in LAN after c1 entered room, got %+v", c2State.Peers)
 	}
+	if switched := hub.JoinSpace(c2.PeerID, protocol.SpaceJoinPayload{Kind: protocol.SpaceKindLAN}); switched {
+		t.Fatal("expected JoinSpace LAN while already in LAN to return false")
+	}
 
-	// 无效房间加入限流：连续 2 次失败后第 3 次触发 RATE_LIMITED
+	// 无效房间加入限流：连续 2 次失败后第 3 次触发 RATE_LIMITED，均应返回 false
 	badJoiner := hub.Register(netip.MustParseAddr("198.51.100.77"), protocol.HelloPayload{OS: "Windows", Browser: "Edge"})
 	_ = drainEvents(badJoiner.SendCh)
-	hub.JoinSpace(badJoiner.PeerID, protocol.SpaceJoinPayload{Kind: protocol.SpaceKindRoom, Code: "999999"})
+	if switched := hub.JoinSpace(badJoiner.PeerID, protocol.SpaceJoinPayload{Kind: protocol.SpaceKindRoom, Code: "999999"}); switched {
+		t.Fatal("expected invalid room JoinSpace to return false")
+	}
 	if code, ok := findErrorCode(drainEvents(badJoiner.SendCh)); !ok || code != protocol.ErrRoomNotFound {
 		t.Fatalf("expected %s on 1st invalid join, got (%q, %v)", protocol.ErrRoomNotFound, code, ok)
 	}
-	hub.JoinSpace(badJoiner.PeerID, protocol.SpaceJoinPayload{Kind: protocol.SpaceKindRoom, Code: "abcdef"})
+	if switched := hub.JoinSpace(badJoiner.PeerID, protocol.SpaceJoinPayload{Kind: protocol.SpaceKindRoom, Code: "abcdef"}); switched {
+		t.Fatal("expected malformed code JoinSpace to return false")
+	}
 	if code, ok := findErrorCode(drainEvents(badJoiner.SendCh)); !ok || code != protocol.ErrInvalidPayload {
 		t.Fatalf("expected %s on 2nd invalid join, got (%q, %v)", protocol.ErrInvalidPayload, code, ok)
 	}
-	hub.JoinSpace(badJoiner.PeerID, protocol.SpaceJoinPayload{Kind: protocol.SpaceKindRoom, Code: "999999"})
+	if switched := hub.JoinSpace(badJoiner.PeerID, protocol.SpaceJoinPayload{Kind: protocol.SpaceKindRoom, Code: "999999"}); switched {
+		t.Fatal("expected rate-limited JoinSpace to return false")
+	}
 	if code, ok := findErrorCode(drainEvents(badJoiner.SendCh)); !ok || code != protocol.ErrRateLimited {
 		t.Fatalf("expected %s on 3rd invalid join, got (%q, %v)", protocol.ErrRateLimited, code, ok)
 	}

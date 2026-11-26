@@ -1,5 +1,5 @@
 import type { FileMeta, SignalType } from './protocol'
-import { createChunkSink, triggerBrowserDownload, type ChunkSink } from './opfsSink'
+import { createChunkSink, removeOpfsTempEntry, triggerBrowserDownload, type ChunkSink } from './opfsSink'
 
 /** 传输底层通道类型：WebRTC 点对点直连或服务端流式中转 */
 export type TransferChannel = 'webrtc' | 'relay'
@@ -22,6 +22,7 @@ export interface ReceivedFileRecord {
   mime: string
   objectUrl: string
   storageMode: 'opfs' | 'memory'
+  opfsTempName?: string
 }
 
 /** 暴露给前端状态树与 UI 展示的任务快照 */
@@ -153,6 +154,14 @@ export class TransferManager {
     if (!s || s.task.direction !== 'receive' || s.task.state !== 'pending') {
       return
     }
+    if (s.task.files.length === 0) {
+      s.abortController.abort()
+      s.task.state = 'failed'
+      s.task.speedBps = 0
+      s.task.errorMessage = '无效的空文件传输邀请'
+      this.emit(s)
+      return
+    }
     s.task.state = 'connecting'
     this.emit(s)
     this.deps.sendSignal(s.task.peerId, 'file.accept', transferId, {})
@@ -202,7 +211,13 @@ export class TransferManager {
       }
       const payload = (data ?? {}) as { files?: FileMeta[] }
       const files = Array.isArray(payload.files) ? payload.files : []
-      const totalBytes = files.reduce((acc, f) => acc + (f.size ?? 0), 0)
+      if (
+        files.length === 0 ||
+        files.some((f) => !f || typeof f.size !== 'number' || !Number.isFinite(f.size) || f.size < 0)
+      ) {
+        return
+      }
+      const totalBytes = files.reduce((acc, f) => acc + f.size, 0)
       const session = this.createSession({
         transferId,
         direction: 'receive',
@@ -316,27 +331,54 @@ export class TransferManager {
     }
   }
 
-  /** 释放已完成任务关联的本地下载 ObjectURL 并移除会话记录 */
+  /** 对端断开或离开空间时中止与该设备相关的未完成传输（保留已完成任务的保存入口） */
+  handlePeerLeft(peerId: string): void {
+    this.failInflightSessions((s) => s.task.peerId === peerId, '对端已断开或离开当前空间')
+  }
+
+  /** 本机 WebSocket 重连并分配了新身份时中止旧连接中的未完成传输（保留已完成记录） */
+  abortInflightOnReconnect(): void {
+    this.failInflightSessions(() => true, '连接已重连，未完成的传输已中止')
+  }
+
+  /** 释放已完成任务关联的本地下载 ObjectURL 与 OPFS 临时文件并移除会话记录 */
   releaseCompletedTask(transferId: string): void {
     const s = this.sessions.get(transferId)
     if (!s) {
       return
     }
-    for (const rec of s.task.receivedFiles) {
-      URL.revokeObjectURL(rec.objectUrl)
-    }
+    this.releaseReceivedFiles(s)
     this.sessions.delete(transferId)
   }
 
-  /** 页面卸载或切换空间时中止所有进行中的传输并回收资源 */
+  /** 页面卸载或切换空间时中止所有进行中的传输并回收 ObjectURL 与 OPFS 临时文件 */
   disposeAll(): void {
     for (const s of this.sessions.values()) {
       this.cleanupResources(s)
-      for (const rec of s.task.receivedFiles) {
-        URL.revokeObjectURL(rec.objectUrl)
-      }
+      this.releaseReceivedFiles(s)
     }
     this.sessions.clear()
+  }
+
+  private failInflightSessions(predicate: (s: InternalSession) => boolean, errorMessage: string): void {
+    for (const s of this.sessions.values()) {
+      if (!this.isTerminalState(s.task.state) && predicate(s)) {
+        this.cleanupResources(s)
+        s.task.state = 'failed'
+        s.task.speedBps = 0
+        s.task.errorMessage = errorMessage
+        this.emit(s)
+      }
+    }
+  }
+
+  private releaseReceivedFiles(s: InternalSession): void {
+    for (const rec of s.task.receivedFiles) {
+      URL.revokeObjectURL(rec.objectUrl)
+      if (rec.opfsTempName) {
+        void removeOpfsTempEntry(rec.opfsTempName)
+      }
+    }
   }
 
   private createSession(opts: {
@@ -661,8 +703,20 @@ export class TransferManager {
     if (typeof data === 'string') {
       const ctrl = JSON.parse(data) as ControlPacket
       if (ctrl.type === 'file.start') {
-        await this.abortActiveSink(s)
+        if (s.activeSink) {
+          await this.failReceiverSession(s, '文件序号异常或乱序')
+          return
+        }
         const fileIndex = ctrl.fileIndex ?? 0
+        if (
+          !Number.isInteger(fileIndex) ||
+          fileIndex < 0 ||
+          fileIndex >= s.task.files.length ||
+          fileIndex !== s.task.receivedFiles.length
+        ) {
+          await this.failReceiverSession(s, '文件序号异常或乱序')
+          return
+        }
         s.activeFileIndex = fileIndex
         s.task.currentFileIndex = fileIndex
         const offeredMeta = s.task.files[fileIndex]
@@ -691,7 +745,12 @@ export class TransferManager {
 
       if (ctrl.type === 'file.end') {
         if (!s.activeSink || !s.activeFileMeta) {
-          throw new Error('unexpected file.end without active file')
+          await this.failReceiverSession(s, '收到意外的 file.end 控制帧')
+          return
+        }
+        if (ctrl.fileIndex !== undefined && ctrl.fileIndex !== s.activeFileIndex) {
+          await this.failReceiverSession(s, '文件序号异常或乱序')
+          return
         }
         const expected = ctrl.totalBytes ?? s.activeExpectedSize
         const offeredMeta = s.task.files[s.activeFileIndex]
@@ -709,10 +768,14 @@ export class TransferManager {
         const fileIndex = s.activeFileIndex
         const url = await sink.finalize(meta.mime, expected)
         const mode = sink.storageMode
+        const opfsTempName = sink.tempName
         s.activeSink = null
         s.activeFileMeta = null
         if (s.abortController.signal.aborted || s.fallbackTriggered) {
           URL.revokeObjectURL(url)
+          if (opfsTempName) {
+            void removeOpfsTempEntry(opfsTempName)
+          }
           return
         }
         s.task.receivedFiles.push({
@@ -721,7 +784,8 @@ export class TransferManager {
           size: expected,
           mime: meta.mime,
           objectUrl: url,
-          storageMode: mode
+          storageMode: mode,
+          ...(opfsTempName ? { opfsTempName } : {})
         })
         triggerBrowserDownload(url, meta.name)
         if (s.task.receivedFiles.length >= s.task.files.length) {
@@ -735,9 +799,17 @@ export class TransferManager {
     }
 
     if (!s.activeSink) {
-      throw new Error('received binary chunk without active file')
+      await this.failReceiverSession(s, '未开启接收文件即收到分片数据')
+      return
     }
     const chunk = await toUint8Array(data)
+    if (s.abortController.signal.aborted || s.fallbackTriggered || !s.activeSink || this.isTerminalState(s.task.state)) {
+      return
+    }
+    if (s.activeReceivedBytes + chunk.byteLength > s.activeExpectedSize) {
+      await this.failReceiverSession(s, '接收字节数超出声明大小')
+      return
+    }
     await s.activeSink.write(chunk)
     s.activeReceivedBytes += chunk.byteLength
     this.advanceProgress(s, chunk.byteLength)
@@ -768,7 +840,7 @@ export class TransferManager {
       s.task.state = 'failed'
       s.task.speedBps = 0
       s.task.errorMessage =
-        maxRelayMB <= 0
+        maxRelayBytes <= 0
           ? '跨网直连受当前网络 NAT 限制，服务端已禁用中转，建议切至同一 Wi-Fi 或配置 TURN'
           : `跨网直连受限，且文件超出服务器 ${maxRelayMB} MB 中转限额`
       this.emit(s)
@@ -849,6 +921,7 @@ export class TransferManager {
           throw new Error(`relay download failed: ${res.status}`)
         }
 
+        let receivedBytes = 0
         if (res.body) {
           const reader = res.body.getReader()
           while (true) {
@@ -860,7 +933,12 @@ export class TransferManager {
               return
             }
             if (value) {
+              if (receivedBytes + value.byteLength > meta.size) {
+                await reader.cancel().catch(() => undefined)
+                throw new Error('接收字节数超出声明大小')
+              }
               await sink.write(value)
+              receivedBytes += value.byteLength
               this.advanceProgress(s, value.byteLength)
             }
           }
@@ -870,14 +948,26 @@ export class TransferManager {
             await this.abortActiveSink(s)
             return
           }
+          if (buf.byteLength > meta.size) {
+            throw new Error('接收字节数超出声明大小')
+          }
           await sink.write(buf)
+          receivedBytes += buf.byteLength
           this.advanceProgress(s, buf.byteLength)
         }
 
+        if (s.abortController.signal.aborted) {
+          await this.abortActiveSink(s)
+          return
+        }
         const url = await sink.finalize(meta.mime, meta.size)
+        const opfsTempName = sink.tempName
         s.activeSink = null
         if (s.abortController.signal.aborted) {
           URL.revokeObjectURL(url)
+          if (opfsTempName) {
+            void removeOpfsTempEntry(opfsTempName)
+          }
           return
         }
         s.task.receivedFiles.push({
@@ -886,7 +976,8 @@ export class TransferManager {
           size: meta.size,
           mime: meta.mime,
           objectUrl: url,
-          storageMode: sink.storageMode
+          storageMode: sink.storageMode,
+          ...(opfsTempName ? { opfsTempName } : {})
         })
         triggerBrowserDownload(url, meta.name)
         this.emit(s)

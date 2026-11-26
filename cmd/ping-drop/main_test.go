@@ -59,6 +59,52 @@ func TestParseConfig_InvalidInputsReturnError(t *testing.T) {
 	if _, err := ParseConfig([]string{"--unknown-flag"}, getenv); err == nil {
 		t.Fatal("expected error for unknown flag")
 	}
+
+	// 非法 PINGDROP_* 环境变量不得静默回退，必须返回明确错误
+	invalidEnvCases := []struct {
+		key string
+		val string
+	}{
+		{"PINGDROP_TRUST_PROXY", "not-bool"},
+		{"PINGDROP_LAN_SHARED_TIMELINE", "maybe"},
+		{"PINGDROP_MAX_ROOMS", "abc"},
+		{"PINGDROP_MAX_TIMELINE_FILE_MB", "12x"},
+		{"PINGDROP_MAX_SPACE_BLOB_MB", "NaN"},
+		{"PINGDROP_MAX_BLOB_MEMORY_MB", "1.5"},
+		{"PINGDROP_MAX_RELAY_MB", "bad"},
+		{"PINGDROP_TTL", "not-duration"},
+		{"PINGDROP_ROOM_GRACE", "forever"},
+	}
+	for _, tc := range invalidEnvCases {
+		badEnv := func(k string) string {
+			if k == tc.key {
+				return tc.val
+			}
+			return ""
+		}
+		if _, err := ParseConfig(nil, badEnv); err == nil {
+			t.Fatalf("expected error for invalid %s=%q", tc.key, tc.val)
+		}
+	}
+
+	// 非正数与越界数值校验
+	invalidFlagCases := [][]string{
+		{"--ttl", "0s"},
+		{"--ttl", "-5s"},
+		{"--room-grace", "0s"},
+		{"--room-grace", "-1m"},
+		{"--max-rooms", "0"},
+		{"--max-rooms", "-1"},
+		{"--max-timeline-file-mb", "0"},
+		{"--max-space-blob-mb", "0"},
+		{"--max-blob-memory-mb", "0"},
+		{"--max-relay-mb", "-1"},
+	}
+	for _, args := range invalidFlagCases {
+		if _, err := ParseConfig(args, getenv); err == nil {
+			t.Fatalf("expected error for invalid bounds args %v", args)
+		}
+	}
 }
 
 func TestBuildAppHandler_WiresConfigAndShutdown(t *testing.T) {

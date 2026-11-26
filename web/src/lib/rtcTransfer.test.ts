@@ -1125,4 +1125,307 @@ describe('rtcTransfer', () => {
     expect(abortUpdates.at(-1)?.state).toBe('cancelled')
     expect(abortUpdates.at(-1)?.receivedFiles).toHaveLength(0)
   })
+
+  it('cleans up OPFS temp entries on releaseCompletedTask and disposeAll for completed OPFS transfers', async () => {
+    const writtenChunks: Uint8Array[] = []
+    class OpfsCompleteWorker {
+      onmessage: ((ev: MessageEvent<{ id: number; ok: boolean; file?: File; size?: number }>) => void) | null = null
+      onerror: ((ev: ErrorEvent) => void) | null = null
+      postMessage(data: { id: number; cmd: string; chunk?: ArrayBuffer }): void {
+        if (data.cmd === 'write' && data.chunk) {
+          writtenChunks.push(new Uint8Array(data.chunk))
+        }
+        queueMicrotask(() => {
+          if (data.cmd === 'finalize') {
+            const total = writtenChunks.reduce((acc, c) => acc + c.byteLength, 0)
+            this.onmessage?.({
+              data: { id: data.id, ok: true, file: new File([new Uint8Array(total)], 'done.bin'), size: total }
+            } as MessageEvent)
+          } else {
+            this.onmessage?.({ data: { id: data.id, ok: true } } as MessageEvent)
+          }
+        })
+      }
+      terminate(): void {}
+    }
+
+    globalThis.Worker = OpfsCompleteWorker as unknown as typeof Worker
+    const removeEntry = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'storage', {
+      configurable: true,
+      value: {
+        getDirectory: vi.fn().mockResolvedValue({
+          getDirectoryHandle: vi.fn().mockResolvedValue({ removeEntry })
+        })
+      }
+    })
+
+    const updates: TransferTask[] = []
+    const mgr = new TransferManager({
+      sendSignal: vi.fn(),
+      getSessionToken: () => 'tok-opfs-clean',
+      getIceServers: () => [],
+      getMaxRelayMB: () => 100,
+      onUpdate: (t) => updates.push(t)
+    })
+
+    // 1. WebRTC OPFS 完成后释放单个卡片：应删除对应 OPFS 临时文件
+    await mgr.handleSignal(
+      'peer-a',
+      'Laptop',
+      'file.offer',
+      'tx-opfs-1',
+      { files: [{ name: 'one.bin', size: 4, mime: 'application/octet-stream' }] },
+      true
+    )
+    await mgr.handleSignal('peer-a', 'Laptop', 'rtc.offer', 'tx-opfs-1', { type: 'offer', sdp: 'v=0' })
+    const dc1 = new MockDataChannel()
+    MockPeerConnection.instances[0].triggerDataChannel(dc1)
+    dc1.onmessage?.({
+      data: JSON.stringify({ type: 'file.start', transferId: 'tx-opfs-1', fileIndex: 0, name: 'one.bin', size: 4 })
+    })
+    dc1.onmessage?.({ data: new Uint8Array([1, 2, 3, 4]).buffer })
+    dc1.onmessage?.({
+      data: JSON.stringify({ type: 'file.end', transferId: 'tx-opfs-1', fileIndex: 0, totalBytes: 4 })
+    })
+    await vi.advanceTimersByTimeAsync(20)
+
+    const t1 = updates.at(-1)!
+    expect(t1.state).toBe('completed')
+    expect(t1.receivedFiles[0].opfsTempName).toBe('tx-opfs-1-0-one.bin')
+    expect(removeEntry).not.toHaveBeenCalled()
+
+    mgr.releaseCompletedTask('tx-opfs-1')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(removeEntry).toHaveBeenCalledWith('tx-opfs-1-0-one.bin')
+
+    // 2. 第二个任务完成后调用 disposeAll()：同样清理 OPFS 临时文件
+    writtenChunks.length = 0
+    await mgr.handleSignal(
+      'peer-a',
+      'Laptop',
+      'file.offer',
+      'tx-opfs-2',
+      { files: [{ name: 'two.bin', size: 2, mime: 'application/octet-stream' }] },
+      true
+    )
+    await mgr.handleSignal('peer-a', 'Laptop', 'rtc.offer', 'tx-opfs-2', { type: 'offer', sdp: 'v=0' })
+    const dc2 = new MockDataChannel()
+    MockPeerConnection.instances[1].triggerDataChannel(dc2)
+    dc2.onmessage?.({
+      data: JSON.stringify({ type: 'file.start', transferId: 'tx-opfs-2', fileIndex: 0, name: 'two.bin', size: 2 })
+    })
+    dc2.onmessage?.({ data: new Uint8Array([7, 8]).buffer })
+    dc2.onmessage?.({
+      data: JSON.stringify({ type: 'file.end', transferId: 'tx-opfs-2', fileIndex: 0, totalBytes: 2 })
+    })
+    await vi.advanceTimersByTimeAsync(20)
+
+    mgr.disposeAll()
+    await vi.advanceTimersByTimeAsync(10)
+    expect(removeEntry).toHaveBeenCalledWith('tx-opfs-2-0-two.bin')
+  })
+
+  it('aborts inflight transfers on handlePeerLeft and abortInflightOnReconnect while preserving completed records', async () => {
+    const updates = new Map<string, TransferTask>()
+    const relayFetcher = vi.fn().mockImplementation(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('tx-done')) {
+        return new Response(new Uint8Array([1, 2]), { status: 200 })
+      }
+      return new Response(new ReadableStream(), { status: 200 })
+    })
+
+    const mgr = new TransferManager({
+      sendSignal: vi.fn(),
+      getSessionToken: () => 'tok-peer-left',
+      getIceServers: () => [],
+      getMaxRelayMB: () => 50,
+      onUpdate: (t) => updates.set(t.transferId, t),
+      fetcher: relayFetcher
+    })
+
+    // peer-a 有 1 个已完成、1 个 pending；peer-b 有 1 个 connecting
+    await mgr.handleSignal(
+      'peer-a',
+      'PeerA',
+      'file.offer',
+      'tx-done',
+      { files: [{ name: 'done.bin', size: 2, mime: 'application/octet-stream' }] },
+      true
+    )
+    await mgr.handleSignal('peer-a', 'PeerA', 'relay.start', 'tx-done', {})
+    expect(updates.get('tx-done')?.state).toBe('completed')
+
+    await mgr.handleSignal('peer-a', 'PeerA', 'file.offer', 'tx-a-pending', {
+      files: [{ name: 'pending.bin', size: 10, mime: 'application/octet-stream' }]
+    })
+    await mgr.handleSignal(
+      'peer-b',
+      'PeerB',
+      'file.offer',
+      'tx-b-conn',
+      { files: [{ name: 'conn.bin', size: 10, mime: 'application/octet-stream' }] },
+      true
+    )
+
+    // peer-a 离开：仅 peer-a 的未完成任务失败，peer-a 已完成任务和 peer-b 任务不受影响
+    mgr.handlePeerLeft('peer-a')
+    expect(updates.get('tx-done')?.state).toBe('completed')
+    expect(updates.get('tx-a-pending')?.state).toBe('failed')
+    expect(updates.get('tx-a-pending')?.errorMessage).toBe('对端已断开或离开当前空间')
+    expect(updates.get('tx-b-conn')?.state).toBe('connecting')
+
+    // 本机重连：剩余未完成任务中止并标记 failed，已完成任务保留
+    mgr.abortInflightOnReconnect()
+    expect(updates.get('tx-done')?.state).toBe('completed')
+    expect(updates.get('tx-b-conn')?.state).toBe('failed')
+    expect(updates.get('tx-b-conn')?.errorMessage).toBe('连接已重连，未完成的传输已中止')
+  })
+
+  it('hardens empty file.offer, fileIndex bounds/order, oversized chunk cap, NaN relay limit, and relay abort before finalize', async () => {
+    const removeEntry = vi.fn().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'storage', {
+      configurable: true,
+      value: {
+        getDirectory: vi.fn().mockResolvedValue({
+          getDirectoryHandle: vi.fn().mockResolvedValue({ removeEntry })
+        })
+      }
+    })
+
+    const updates: TransferTask[] = []
+    const mgr = new TransferManager({
+      sendSignal: vi.fn(),
+      getSessionToken: () => 'tok-sec',
+      getIceServers: () => [],
+      getMaxRelayMB: () => Number.NaN,
+      onUpdate: (t) => updates.push(t),
+      connectTimeoutMs: 500
+    })
+
+    // 1. 空 files 邀请被忽略
+    await mgr.handleSignal('peer-a', 'Laptop', 'file.offer', 'tx-empty-files', { files: [] })
+    expect(updates.some((u) => u.transferId === 'tx-empty-files')).toBe(false)
+
+    // 2. maxRelayMB 为 NaN 时错误信息不得出现 "NaN MB"
+    const txNaN = mgr.startOutgoing('peer-b', 'Phone', [new File([new Uint8Array([1])], 'a.bin')])
+    await mgr.handleSignal('peer-b', 'Phone', 'file.accept', txNaN.transferId, {})
+    await vi.advanceTimersByTimeAsync(500)
+    const nanFail = updates.filter((u) => u.transferId === txNaN.transferId).at(-1)!
+    expect(nanFail.state).toBe('failed')
+    expect(nanFail.errorMessage).not.toContain('NaN')
+    expect(nanFail.errorMessage).toContain('服务端已禁用中转')
+
+    // 3. file.start fileIndex 越界或乱序应立即失败
+    for (const badIdx of [-1, 1, 1.5]) {
+      const tid = `tx-bad-idx-${String(badIdx)}`
+      await mgr.handleSignal(
+        'peer-a',
+        'Laptop',
+        'file.offer',
+        tid,
+        { files: [{ name: 'f0.bin', size: 4, mime: 'application/octet-stream' }] },
+        true
+      )
+      await mgr.handleSignal('peer-a', 'Laptop', 'rtc.offer', tid, { type: 'offer', sdp: 'v=0' })
+      const dc = new MockDataChannel()
+      MockPeerConnection.instances.at(-1)!.triggerDataChannel(dc)
+      dc.onmessage?.({
+        data: JSON.stringify({ type: 'file.start', transferId: tid, fileIndex: badIdx, name: 'f0.bin', size: 4 })
+      })
+      await vi.advanceTimersByTimeAsync(10)
+      const last = updates.filter((u) => u.transferId === tid).at(-1)!
+      expect(last.state).toBe('failed')
+      expect(last.errorMessage).toContain('文件序号异常或乱序')
+    }
+
+    // 4. file.end fileIndex 与 activeFileIndex 不一致应立即失败
+    await mgr.handleSignal(
+      'peer-a',
+      'Laptop',
+      'file.offer',
+      'tx-end-idx',
+      { files: [{ name: 'f0.bin', size: 2, mime: 'application/octet-stream' }] },
+      true
+    )
+    await mgr.handleSignal('peer-a', 'Laptop', 'rtc.offer', 'tx-end-idx', { type: 'offer', sdp: 'v=0' })
+    const dcEnd = new MockDataChannel()
+    MockPeerConnection.instances.at(-1)!.triggerDataChannel(dcEnd)
+    dcEnd.onmessage?.({
+      data: JSON.stringify({ type: 'file.start', transferId: 'tx-end-idx', fileIndex: 0, name: 'f0.bin', size: 2 })
+    })
+    dcEnd.onmessage?.({ data: new Uint8Array([1, 2]).buffer })
+    dcEnd.onmessage?.({
+      data: JSON.stringify({ type: 'file.end', transferId: 'tx-end-idx', fileIndex: 1, totalBytes: 2 })
+    })
+    await vi.advanceTimersByTimeAsync(10)
+    const endIdxFail = updates.filter((u) => u.transferId === 'tx-end-idx').at(-1)!
+    expect(endIdxFail.state).toBe('failed')
+    expect(endIdxFail.errorMessage).toContain('文件序号异常或乱序')
+
+    // 5. 恶意发送方超发字节数：在收到 file.end 前即应拦截失败并关闭 PC
+    await mgr.handleSignal(
+      'peer-a',
+      'Laptop',
+      'file.offer',
+      'tx-overflow',
+      { files: [{ name: 'small.bin', size: 4, mime: 'application/octet-stream' }] },
+      true
+    )
+    await mgr.handleSignal('peer-a', 'Laptop', 'rtc.offer', 'tx-overflow', { type: 'offer', sdp: 'v=0' })
+    const pcOver = MockPeerConnection.instances.at(-1)!
+    const dcOver = new MockDataChannel()
+    pcOver.triggerDataChannel(dcOver)
+    dcOver.onmessage?.({
+      data: JSON.stringify({ type: 'file.start', transferId: 'tx-overflow', fileIndex: 0, name: 'small.bin', size: 4 })
+    })
+    dcOver.onmessage?.({ data: new Uint8Array([1, 2, 3, 4, 5]).buffer })
+    await vi.advanceTimersByTimeAsync(10)
+    const overFail = updates.filter((u) => u.transferId === 'tx-overflow').at(-1)!
+    expect(overFail.state).toBe('failed')
+    expect(overFail.errorMessage).toContain('接收字节数超出声明大小')
+    expect(pcOver.closed).toBe(true)
+
+    // 6. runReceiverRelay 在 reader.read() 结束但 finalize 前被中止时，不得调用 finalize 或触发下载
+    let readStep = 0
+    const relayStream = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        readStep += 1
+        if (readStep === 1) {
+          controller.enqueue(new Uint8Array([1, 2]))
+          return
+        }
+        // 在第二次 read 返回 done=true 前，先通过 cancelTransfer 中止会话
+        await new Promise((r) => setTimeout(r, 20))
+        controller.close()
+      }
+    })
+    const streamMgr = new TransferManager({
+      sendSignal: vi.fn(),
+      getSessionToken: () => 'tok-stream',
+      getIceServers: () => [],
+      getMaxRelayMB: () => 50,
+      onUpdate: (t) => updates.push(t),
+      fetcher: vi.fn().mockResolvedValue(new Response(relayStream, { status: 200 }))
+    })
+    clickSpy.mockClear()
+    await streamMgr.handleSignal(
+      'peer-a',
+      'Laptop',
+      'file.offer',
+      'tx-relay-pre-finalize-abort',
+      { files: [{ name: 's.bin', size: 2, mime: 'application/octet-stream' }] },
+      true
+    )
+    const relayRun = streamMgr.handleSignal('peer-a', 'Laptop', 'relay.start', 'tx-relay-pre-finalize-abort', {})
+    await vi.advanceTimersByTimeAsync(5)
+    streamMgr.cancelTransfer('tx-relay-pre-finalize-abort')
+    await vi.advanceTimersByTimeAsync(30)
+    await relayRun
+    const relayAborted = updates.filter((u) => u.transferId === 'tx-relay-pre-finalize-abort').at(-1)!
+    expect(relayAborted.state).toBe('cancelled')
+    expect(relayAborted.receivedFiles).toHaveLength(0)
+    expect(clickSpy).not.toHaveBeenCalled()
+  })
 })

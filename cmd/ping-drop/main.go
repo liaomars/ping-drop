@@ -46,18 +46,58 @@ type AppConfig struct {
 
 // ParseConfig 从命令行 Flag 与环境变量加载配置（Flag 优先）。
 func ParseConfig(args []string, getenv func(string) string) (AppConfig, error) {
+	if getenv == nil {
+		getenv = func(string) string { return "" }
+	}
+	trustProxy, err := envBool(getenv, "PINGDROP_TRUST_PROXY", false)
+	if err != nil {
+		return AppConfig{}, err
+	}
+	lanSharedTimeline, err := envBool(getenv, "PINGDROP_LAN_SHARED_TIMELINE", false)
+	if err != nil {
+		return AppConfig{}, err
+	}
+	ttl, err := envDuration(getenv, "PINGDROP_TTL", 30*time.Minute)
+	if err != nil {
+		return AppConfig{}, err
+	}
+	roomGrace, err := envDuration(getenv, "PINGDROP_ROOM_GRACE", 10*time.Minute)
+	if err != nil {
+		return AppConfig{}, err
+	}
+	maxRooms, err := envInt(getenv, "PINGDROP_MAX_ROOMS", protocol.DefaultMaxRooms)
+	if err != nil {
+		return AppConfig{}, err
+	}
+	maxTimelineFileMB, err := envInt(getenv, "PINGDROP_MAX_TIMELINE_FILE_MB", protocol.DefaultMaxTimelineFileMB)
+	if err != nil {
+		return AppConfig{}, err
+	}
+	maxSpaceBlobMB, err := envInt(getenv, "PINGDROP_MAX_SPACE_BLOB_MB", protocol.DefaultMaxSpaceBlobMB)
+	if err != nil {
+		return AppConfig{}, err
+	}
+	maxBlobMemoryMB, err := envInt(getenv, "PINGDROP_MAX_BLOB_MEMORY_MB", protocol.DefaultMaxBlobMemoryMB)
+	if err != nil {
+		return AppConfig{}, err
+	}
+	maxRelayMB, err := envInt(getenv, "PINGDROP_MAX_RELAY_MB", protocol.DefaultMaxRelayMB)
+	if err != nil {
+		return AppConfig{}, err
+	}
+
 	cfg := AppConfig{
 		Addr:              envString(getenv, "PINGDROP_ADDR", ":8080"),
-		TrustProxy:        envBool(getenv, "PINGDROP_TRUST_PROXY", false),
+		TrustProxy:        trustProxy,
 		ProxyIPHeader:     envString(getenv, "PINGDROP_PROXY_IP_HEADER", ""),
-		LANSharedTimeline: envBool(getenv, "PINGDROP_LAN_SHARED_TIMELINE", false),
-		TTL:               envDuration(getenv, "PINGDROP_TTL", 30*time.Minute),
-		RoomGrace:         envDuration(getenv, "PINGDROP_ROOM_GRACE", 10*time.Minute),
-		MaxRooms:          envInt(getenv, "PINGDROP_MAX_ROOMS", protocol.DefaultMaxRooms),
-		MaxTimelineFileMB: envInt(getenv, "PINGDROP_MAX_TIMELINE_FILE_MB", protocol.DefaultMaxTimelineFileMB),
-		MaxSpaceBlobMB:    envInt(getenv, "PINGDROP_MAX_SPACE_BLOB_MB", protocol.DefaultMaxSpaceBlobMB),
-		MaxBlobMemoryMB:   envInt(getenv, "PINGDROP_MAX_BLOB_MEMORY_MB", protocol.DefaultMaxBlobMemoryMB),
-		MaxRelayMB:        envInt(getenv, "PINGDROP_MAX_RELAY_MB", protocol.DefaultMaxRelayMB),
+		LANSharedTimeline: lanSharedTimeline,
+		TTL:               ttl,
+		RoomGrace:         roomGrace,
+		MaxRooms:          maxRooms,
+		MaxTimelineFileMB: maxTimelineFileMB,
+		MaxSpaceBlobMB:    maxSpaceBlobMB,
+		MaxBlobMemoryMB:   maxBlobMemoryMB,
+		MaxRelayMB:        maxRelayMB,
 	}
 	originsRaw := envString(getenv, "PINGDROP_ALLOWED_ORIGINS", "")
 	iceRaw := envString(getenv, "PINGDROP_ICE_SERVERS", defaultICEServersJSON)
@@ -80,6 +120,28 @@ func ParseConfig(args []string, getenv func(string) string) (AppConfig, error) {
 
 	if err := fs.Parse(args); err != nil {
 		return AppConfig{}, fmt.Errorf("parse flags: %w", err)
+	}
+
+	if cfg.TTL <= 0 {
+		return AppConfig{}, fmt.Errorf("ttl must be positive, got %v", cfg.TTL)
+	}
+	if cfg.RoomGrace <= 0 {
+		return AppConfig{}, fmt.Errorf("room-grace must be positive, got %v", cfg.RoomGrace)
+	}
+	if cfg.MaxRooms <= 0 {
+		return AppConfig{}, fmt.Errorf("max-rooms must be positive, got %d", cfg.MaxRooms)
+	}
+	if cfg.MaxTimelineFileMB <= 0 {
+		return AppConfig{}, fmt.Errorf("max-timeline-file-mb must be positive, got %d", cfg.MaxTimelineFileMB)
+	}
+	if cfg.MaxSpaceBlobMB <= 0 {
+		return AppConfig{}, fmt.Errorf("max-space-blob-mb must be positive, got %d", cfg.MaxSpaceBlobMB)
+	}
+	if cfg.MaxBlobMemoryMB <= 0 {
+		return AppConfig{}, fmt.Errorf("max-blob-memory-mb must be positive, got %d", cfg.MaxBlobMemoryMB)
+	}
+	if cfg.MaxRelayMB < 0 {
+		return AppConfig{}, fmt.Errorf("max-relay-mb must be >= 0, got %d", cfg.MaxRelayMB)
 	}
 
 	if strings.TrimSpace(originsRaw) != "" {
@@ -197,29 +259,38 @@ func envString(getenv func(string) string, key, def string) string {
 	return def
 }
 
-func envBool(getenv func(string) string, key string, def bool) bool {
-	if v := strings.TrimSpace(getenv(key)); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			return b
-		}
+func envBool(getenv func(string) string, key string, def bool) (bool, error) {
+	v := strings.TrimSpace(getenv(key))
+	if v == "" {
+		return def, nil
 	}
-	return def
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("parse env %s=%q as bool: %w", key, v, err)
+	}
+	return b, nil
 }
 
-func envInt(getenv func(string) string, key string, def int) int {
-	if v := strings.TrimSpace(getenv(key)); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
+func envInt(getenv func(string) string, key string, def int) (int, error) {
+	v := strings.TrimSpace(getenv(key))
+	if v == "" {
+		return def, nil
 	}
-	return def
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("parse env %s=%q as int: %w", key, v, err)
+	}
+	return n, nil
 }
 
-func envDuration(getenv func(string) string, key string, def time.Duration) time.Duration {
-	if v := strings.TrimSpace(getenv(key)); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
-		}
+func envDuration(getenv func(string) string, key string, def time.Duration) (time.Duration, error) {
+	v := strings.TrimSpace(getenv(key))
+	if v == "" {
+		return def, nil
 	}
-	return def
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("parse env %s=%q as duration: %w", key, v, err)
+	}
+	return d, nil
 }

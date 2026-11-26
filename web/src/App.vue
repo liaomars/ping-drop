@@ -23,7 +23,7 @@ const showMobileQuickBar = computed(
 )
 
 onMounted(() => {
-  store.start()
+  void store.start()
 })
 
 onUnmounted(() => {

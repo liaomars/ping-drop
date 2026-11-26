@@ -709,4 +709,106 @@ func TestHTTP_WSEventDispatchAndBlobEdgeCases(t *testing.T) {
 	if notFoundResp.StatusCode != http.StatusNotFound {
 		t.Fatalf("expected 404 for nonexistent blob, got %d", notFoundResp.StatusCode)
 	}
+
+	// 4. 上传名为 ".." 的文件应被清洗为 "file.bin"
+	dotdotResp := uploadMultipartBlob(t, srv.URL, welcomeA.SessionToken, "..", []byte("plain"))
+	defer dotdotResp.Body.Close()
+	if dotdotResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 for '..' filename, got %d", dotdotResp.StatusCode)
+	}
+	var dotdotResult struct {
+		Item protocol.TimelineItem `json:"item"`
+	}
+	_ = json.NewDecoder(dotdotResp.Body).Decode(&dotdotResult)
+	if dotdotResult.Item.FileName != "file.bin" {
+		t.Fatalf("expected '..' filename sanitized to file.bin, got %q", dotdotResult.Item.FileName)
+	}
+}
+
+func TestHTTP_FailedSpaceSwitchDoesNotCancelActiveRelay(t *testing.T) {
+	h, _, _ := newTestServerHandler(nil)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	connA, welcomeA := dialAndHello(t, ctx, srv.URL, srv.URL, protocol.HelloPayload{Name: "A", OS: "macOS", Browser: "Chrome"})
+	defer connA.CloseNow()
+
+	createRaw, _ := protocol.EncodeEnvelope(protocol.EventRoomCreate, struct{}{})
+	_ = connA.Write(ctx, websocket.MessageText, createRaw)
+	stateEnv := readEnvelopeUntil(t, ctx, connA, protocol.EventSpaceState)
+	var state protocol.SpaceStatePayload
+	_ = json.Unmarshal(stateEnv.Payload, &state)
+
+	connB, welcomeB := dialAndHello(t, ctx, srv.URL, srv.URL, protocol.HelloPayload{
+		Name:     "B",
+		OS:       "iOS",
+		Browser:  "Safari",
+		RoomCode: state.Space.Code,
+	})
+	defer connB.CloseNow()
+	_ = readEnvelopeUntil(t, ctx, connA, protocol.EventPeerJoined)
+
+	// 注册一个有效中转传输
+	acceptRaw, _ := protocol.EncodeEnvelope(protocol.EventRTCSignal, protocol.RTCSignalPayload{
+		ToPeerID:   welcomeA.PeerID,
+		SignalType: "file.accept",
+		TransferID: "tx-keep-alive",
+	})
+	_ = connB.Write(ctx, websocket.MessageText, acceptRaw)
+	_ = readEnvelopeUntil(t, ctx, connA, protocol.EventRTCSignal)
+
+	// A 尝试加入不存在的房间（失败）及重新加入当前已在的房间（未切换），均不得取消已授权的 relay 传输
+	badJoinRaw, _ := protocol.EncodeEnvelope(protocol.EventSpaceJoin, protocol.SpaceJoinPayload{
+		Kind: protocol.SpaceKindRoom,
+		Code: "999999",
+	})
+	_ = connA.Write(ctx, websocket.MessageText, badJoinRaw)
+	_ = readEnvelopeUntil(t, ctx, connA, protocol.EventError)
+
+	sameJoinRaw, _ := protocol.EncodeEnvelope(protocol.EventSpaceJoin, protocol.SpaceJoinPayload{
+		Kind: protocol.SpaceKindRoom,
+		Code: state.Space.Code,
+	})
+	_ = connA.Write(ctx, websocket.MessageText, sameJoinRaw)
+
+	// 用 Ping/Pong 同步确保 server 已处理完 sameJoinRaw
+	pingRaw, _ := protocol.EncodeEnvelope(protocol.EventPing, struct{}{})
+	_ = connA.Write(ctx, websocket.MessageText, pingRaw)
+	_ = readEnvelopeUntil(t, ctx, connA, protocol.EventPong)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var upCode, downCode int
+	go func() {
+		defer wg.Done()
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/relay/tx-keep-alive/0", strings.NewReader("still-alive"))
+		req.Header.Set("Authorization", "Bearer "+welcomeA.SessionToken)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+		upCode = resp.StatusCode
+		_, _ = io.ReadAll(resp.Body)
+	}()
+	go func() {
+		defer wg.Done()
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/relay/tx-keep-alive/0", nil)
+		req.Header.Set("Authorization", "Bearer "+welcomeB.SessionToken)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+		downCode = resp.StatusCode
+		_, _ = io.ReadAll(resp.Body)
+	}()
+	wg.Wait()
+
+	if upCode != http.StatusOK || downCode != http.StatusOK {
+		t.Fatalf("expected active relay preserved after failed/no-op space.join, got up=%d down=%d", upCode, downCode)
+	}
 }

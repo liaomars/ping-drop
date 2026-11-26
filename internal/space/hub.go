@@ -227,28 +227,28 @@ func (h *Hub) UpdateName(peerID, name string) {
 	}
 }
 
-// CreateRoom 为发起设备签发新的 6 位数字配对房间并立即切入该房间。
-func (h *Hub) CreateRoom(peerID string) {
+// CreateRoom 为发起设备签发新的 6 位数字配对房间并立即切入该房间；仅在成功切入新房间时返回 true。
+func (h *Hub) CreateRoom(peerID string) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	p, ok := h.peers[peerID]
 	if !ok {
-		return
+		return false
 	}
 	if !h.allowAttemptLocked(h.rateCreate, p.ipKey) {
 		h.sendEventLocked(p, protocol.EventError, protocol.ErrorPayload{
 			Code:    protocol.ErrRateLimited,
 			Message: "创建房间过于频繁，请 1 分钟后再试",
 		})
-		return
+		return false
 	}
 	if len(h.rooms) >= h.cfg.MaxRooms {
 		h.sendEventLocked(p, protocol.EventError, protocol.ErrorPayload{
 			Code:    protocol.ErrRoomLimitReached,
 			Message: "当前活跃房间数已达上限，请稍后再试",
 		})
-		return
+		return false
 	}
 	code, err := h.allocateRoomCodeLocked()
 	if err != nil {
@@ -256,7 +256,7 @@ func (h *Hub) CreateRoom(peerID string) {
 			Code:    protocol.ErrRoomLimitReached,
 			Message: "配对码分配失败，请稍后重试",
 		})
-		return
+		return false
 	}
 
 	h.recordAttemptLocked(h.rateCreate, p.ipKey)
@@ -264,22 +264,22 @@ func (h *Hub) CreateRoom(peerID string) {
 		code:      code,
 		createdAt: h.cfg.Now(),
 	}
-	h.switchPeerSpaceLocked(p, "room:"+code)
+	return h.switchPeerSpaceLocked(p, "room:"+code)
 }
 
-// JoinSpace 将设备切换至默认局域网或指定的已存在 6 位配对房间。
-func (h *Hub) JoinSpace(peerID string, req protocol.SpaceJoinPayload) {
+// JoinSpace 将设备切换至默认局域网或指定的已存在 6 位配对房间；仅在确实发生空间切换时返回 true。
+func (h *Hub) JoinSpace(peerID string, req protocol.SpaceJoinPayload) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	p, ok := h.peers[peerID]
 	if !ok {
-		return
+		return false
 	}
 
 	switch req.Kind {
 	case protocol.SpaceKindLAN:
-		h.switchPeerSpaceLocked(p, LANGroupKey(p.clientIP))
+		return h.switchPeerSpaceLocked(p, LANGroupKey(p.clientIP))
 	case protocol.SpaceKindRoom:
 		code := strings.TrimSpace(req.Code)
 		if !h.allowAttemptLocked(h.rateFailed, p.ipKey) {
@@ -287,7 +287,7 @@ func (h *Hub) JoinSpace(peerID string, req protocol.SpaceJoinPayload) {
 				Code:    protocol.ErrRateLimited,
 				Message: "无效配对码尝试过于频繁，请稍后再试",
 			})
-			return
+			return false
 		}
 		if !isValidRoomCode(code) {
 			h.recordAttemptLocked(h.rateFailed, p.ipKey)
@@ -295,7 +295,7 @@ func (h *Hub) JoinSpace(peerID string, req protocol.SpaceJoinPayload) {
 				Code:    protocol.ErrInvalidPayload,
 				Message: "配对码必须为 6 位数字",
 			})
-			return
+			return false
 		}
 		if _, exists := h.rooms[code]; !exists {
 			h.recordAttemptLocked(h.rateFailed, p.ipKey)
@@ -303,14 +303,15 @@ func (h *Hub) JoinSpace(peerID string, req protocol.SpaceJoinPayload) {
 				Code:    protocol.ErrRoomNotFound,
 				Message: "配对码已过期或不存在",
 			})
-			return
+			return false
 		}
-		h.switchPeerSpaceLocked(p, "room:"+code)
+		return h.switchPeerSpaceLocked(p, "room:"+code)
 	default:
 		h.sendEventLocked(p, protocol.EventError, protocol.ErrorPayload{
 			Code:    protocol.ErrInvalidPayload,
 			Message: "不支持的空间类型",
 		})
+		return false
 	}
 }
 
@@ -573,12 +574,13 @@ func (h *Hub) StartCleaner(ctx context.Context, interval time.Duration) {
 	}()
 }
 
-func (h *Hub) switchPeerSpaceLocked(p *peerRecord, nextSpaceID string) {
+func (h *Hub) switchPeerSpaceLocked(p *peerRecord, nextSpaceID string) bool {
 	if p.spaceID == nextSpaceID {
-		return
+		return false
 	}
 	h.detachPeerFromSpaceLocked(p)
 	h.attachPeerToSpaceLocked(p, nextSpaceID)
+	return true
 }
 
 func (h *Hub) attachPeerToSpaceLocked(p *peerRecord, spaceID string) {

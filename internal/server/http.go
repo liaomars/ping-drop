@@ -251,17 +251,15 @@ func dispatchWSEvent(cfg Config, client *space.ClientConn, env protocol.Envelope
 			cfg.Hub.UpdateName(client.PeerID, p.Name)
 		}
 	case protocol.EventRoomCreate:
-		if cfg.Relay != nil {
+		if cfg.Hub.CreateRoom(client.PeerID) && cfg.Relay != nil {
 			cfg.Relay.CancelPeerTransfers(client.PeerID)
 		}
-		cfg.Hub.CreateRoom(client.PeerID)
 	case protocol.EventSpaceJoin:
 		var p protocol.SpaceJoinPayload
 		if json.Unmarshal(env.Payload, &p) == nil {
-			if cfg.Relay != nil {
+			if cfg.Hub.JoinSpace(client.PeerID, p) && cfg.Relay != nil {
 				cfg.Relay.CancelPeerTransfers(client.PeerID)
 			}
-			cfg.Hub.JoinSpace(client.PeerID, p)
 		}
 	case protocol.EventTimelinePost:
 		var p protocol.TimelinePostPayload
@@ -358,7 +356,7 @@ func handleBlobUpload(w http.ResponseWriter, r *http.Request, cfg Config) {
 	}
 	kind, safeMime := ClassifyUpload(head)
 	fileName := filepath.Base(strings.ReplaceAll(strings.TrimSpace(header.Filename), "\\", "/"))
-	if fileName == "" || fileName == "." || fileName == "/" {
+	if fileName == "" || fileName == "." || fileName == ".." || fileName == "/" {
 		fileName = "file.bin"
 	}
 

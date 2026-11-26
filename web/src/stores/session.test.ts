@@ -41,12 +41,14 @@ function createDeferred<T>() {
 }
 
 const mockCheckStorageQuota = vi.fn()
+const mockCleanupStaleOpfsTempFiles = vi.fn()
 
 vi.mock('../lib/opfsSink', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/opfsSink')>()
   return {
     ...actual,
-    checkStorageQuota: (...args: Parameters<typeof actual.checkStorageQuota>) => mockCheckStorageQuota(...args)
+    checkStorageQuota: (...args: Parameters<typeof actual.checkStorageQuota>) => mockCheckStorageQuota(...args),
+    cleanupStaleOpfsTempFiles: () => mockCleanupStaleOpfsTempFiles()
   }
 })
 
@@ -61,6 +63,8 @@ describe('session store', () => {
     vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
     mockCheckStorageQuota.mockReset()
     mockCheckStorageQuota.mockResolvedValue({ ok: true, availableBytes: 100_000_000 })
+    mockCleanupStaleOpfsTempFiles.mockReset()
+    mockCleanupStaleOpfsTempFiles.mockResolvedValue(undefined)
   })
 
   it('handles welcome, space.state, room URL sync and idempotent timeline deduplication', async () => {
@@ -638,7 +642,7 @@ describe('session store', () => {
     const store = createSessionStore({
       WebSocketImpl: MockWebSocket as unknown as typeof WebSocket
     })
-    store.start()
+    await store.start()
     expect(MockWebSocket.instances).toHaveLength(1)
     const sock = MockWebSocket.instances[0]
     sock.open()
@@ -746,6 +750,184 @@ describe('session store', () => {
     expect(sock.sent.filter((m) => m.type === 'rtc.signal').length).toBe(
       sock.sent.slice(0, sentCountBeforeSwitch).filter((m) => m.type === 'rtc.signal').length
     )
+
+    store.destroy()
+  })
+
+  it('awaits startup OPFS cleanup before connecting WS and aborts connect if destroyed during cleanup', async () => {
+    const cleanupDeferred = createDeferred<void>()
+    mockCleanupStaleOpfsTempFiles.mockReturnValueOnce(cleanupDeferred.promise)
+
+    const store1 = createSessionStore({
+      WebSocketImpl: MockWebSocket as unknown as typeof WebSocket
+    })
+    const startP1 = store1.start()
+    expect(MockWebSocket.instances).toHaveLength(0)
+
+    cleanupDeferred.resolve()
+    await startP1
+    expect(MockWebSocket.instances).toHaveLength(1)
+    store1.destroy()
+
+    // 若清理过程中已调用 destroy()，不得再发起 ws.connect()
+    MockWebSocket.instances = []
+    const cleanupDeferred2 = createDeferred<void>()
+    mockCleanupStaleOpfsTempFiles.mockReturnValueOnce(cleanupDeferred2.promise)
+    const store2 = createSessionStore({
+      WebSocketImpl: MockWebSocket as unknown as typeof WebSocket
+    })
+    const startP2 = store2.start()
+    store2.destroy()
+    cleanupDeferred2.resolve()
+    await startP2
+    expect(MockWebSocket.instances).toHaveLength(0)
+  })
+
+  it('fails inflight transfers on peer.left and same-space WS reconnect while keeping completed tasks, and isolates stale previewEpoch', async () => {
+    const previewDeferred = createDeferred<Response>()
+    const fetcher = vi.fn().mockImplementation((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/relay/tx-completed/')) {
+        return Promise.resolve(new Response(new Uint8Array([1, 2]), { status: 200 }))
+      }
+      if (url.includes('/api/blobs/blob-slow')) {
+        return previewDeferred.promise
+      }
+      return Promise.resolve(new Response(new Blob(['img-new']), { status: 200 }))
+    })
+    const store = createSessionStore({
+      fetcher,
+      WebSocketImpl: MockWebSocket as unknown as typeof WebSocket
+    })
+    await store.start()
+    const sock = MockWebSocket.instances[0]
+    sock.open()
+
+    store.handleServerEvent('welcome', {
+      peerId: 'p-1',
+      sessionToken: 'tok-1',
+      self: { id: 'p-1', name: 'Mac', deviceType: 'desktop', os: 'macOS', browser: 'Chrome' },
+      iceServers: [],
+      limits: { maxTimelineFileMB: 20, maxRelayMB: 100 }
+    })
+    store.handleServerEvent('space.state', {
+      space: { kind: 'room', code: '482917', sharedTimelineEnabled: true },
+      peers: [
+        { id: 'p-1', name: 'Mac', deviceType: 'desktop', os: 'macOS', browser: 'Chrome' },
+        { id: 'p-other', name: 'Phone', deviceType: 'mobile', os: 'iOS', browser: 'Safari' }
+      ],
+      timeline: [
+        {
+          id: 'img-1',
+          kind: 'image',
+          senderId: 'p-other',
+          senderName: 'Phone',
+          blobId: 'blob-slow',
+          fileName: 'slow.png',
+          mime: 'image/png',
+          size: 3,
+          createdAt: 100,
+          expiresAt: 200
+        }
+      ]
+    })
+
+    // 1. 完成一个传输，再启动一个对 p-other 的待接收传输
+    store.handleServerEvent('rtc.signal', {
+      fromPeerId: 'p-other',
+      signalType: 'file.offer',
+      transferId: 'tx-completed',
+      data: { files: [{ name: 'ok.bin', size: 2, mime: 'application/octet-stream' }] }
+    })
+    await store.acceptIncoming('tx-completed')
+    store.handleServerEvent('rtc.signal', {
+      fromPeerId: 'p-other',
+      signalType: 'relay.start',
+      transferId: 'tx-completed',
+      data: {}
+    })
+    await vi.waitFor(() => {
+      expect(store.state.transfers.find((t) => t.transferId === 'tx-completed')?.state).toBe('completed')
+    })
+
+    store.handleServerEvent('rtc.signal', {
+      fromPeerId: 'p-other',
+      signalType: 'file.offer',
+      transferId: 'tx-left',
+      data: { files: [{ name: 'left.bin', size: 4, mime: 'application/octet-stream' }] }
+    })
+
+    // 2. peer.left 应中止 tx-left 但保留 tx-completed
+    store.handleServerEvent('peer.left', { peerId: 'p-other' })
+    expect(store.state.transfers.find((t) => t.transferId === 'tx-left')?.state).toBe('failed')
+    expect(store.state.transfers.find((t) => t.transferId === 'tx-completed')?.state).toBe('completed')
+
+    // 3. 新建一个对 p-other-2 的 pending 传输，然后模拟 WS 同空间重连收到新 welcome (peerId: p-2) + 同空间 space.state
+    store.handleServerEvent('peer.joined', {
+      peer: { id: 'p-other-2', name: 'iPad', deviceType: 'mobile', os: 'iPadOS', browser: 'Safari' }
+    })
+    store.handleServerEvent('rtc.signal', {
+      fromPeerId: 'p-other-2',
+      signalType: 'file.offer',
+      transferId: 'tx-reconn',
+      data: { files: [{ name: 'reconn.bin', size: 4, mime: 'application/octet-stream' }] }
+    })
+
+    store.handleServerEvent('welcome', {
+      peerId: 'p-2',
+      sessionToken: 'tok-2',
+      self: { id: 'p-2', name: 'Mac', deviceType: 'desktop', os: 'macOS', browser: 'Chrome' },
+      iceServers: [],
+      limits: { maxTimelineFileMB: 20, maxRelayMB: 100 }
+    })
+    store.handleServerEvent('space.state', {
+      space: { kind: 'room', code: '482917', sharedTimelineEnabled: true },
+      peers: [
+        { id: 'p-2', name: 'Mac', deviceType: 'desktop', os: 'macOS', browser: 'Chrome' },
+        { id: 'p-other-2', name: 'iPad', deviceType: 'mobile', os: 'iPadOS', browser: 'Safari' }
+      ],
+      timeline: []
+    })
+
+    expect(store.state.transfers.find((t) => t.transferId === 'tx-reconn')?.state).toBe('failed')
+    expect(store.state.transfers.find((t) => t.transferId === 'tx-completed')?.state).toBe('completed')
+
+    // 旧 preview 请求在重连 clearPreviewUrls() 后完成，不得写回 state.blobPreviewUrls
+    previewDeferred.resolve(new Response(new Blob(['img-old']), { status: 200 }))
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(store.state.blobPreviewUrls['blob-slow']).toBeUndefined()
+
+    // 4. 校验发送 DM 生成递增不重复 ID、acceptIncoming 等待配额期间状态变化取消发送、以及 WS 断线时 postTimelineText/joinRoom 提示失败
+    expect(store.sendDM('p-other-2', 'm1')).toBe(true)
+    expect(store.sendDM('p-other-2', 'm2')).toBe(true)
+    const dms = store.state.dmsByPeer['p-other-2']
+    expect(dms).toHaveLength(2)
+    expect(dms[0].id).not.toBe(dms[1].id)
+
+    const quotaDef = createDeferred<{ ok: boolean; availableBytes: number | null }>()
+    mockCheckStorageQuota.mockReturnValueOnce(quotaDef.promise)
+    store.handleServerEvent('rtc.signal', {
+      fromPeerId: 'p-other-2',
+      signalType: 'file.offer',
+      transferId: 'tx-reject-mid-quota',
+      data: { files: [{ name: 'mid.bin', size: 100, mime: 'application/octet-stream' }] }
+    })
+    const acceptP = store.acceptIncoming('tx-reject-mid-quota')
+    store.rejectTransfer('tx-reject-mid-quota')
+    store.state.toast = null
+    quotaDef.resolve({ ok: false, availableBytes: 1 })
+    await acceptP
+    expect(store.state.transfers.find((t) => t.transferId === 'tx-reject-mid-quota')?.state).toBe('rejected')
+    expect(store.state.toast).toBeNull()
+
+    // 关闭 WS 后 postTimelineText 与 joinRoom 应返回 false 并提示连接已断开
+    sock.close()
+    expect(store.postTimelineText('offline msg')).toBe(false)
+    expect(store.state.toast).toMatchObject({ kind: 'error', message: '连接已断开，请稍后重试' })
+    store.state.toast = null
+    expect(store.joinRoom('123456')).toBe(false)
+    expect(store.state.toast).toMatchObject({ kind: 'error', message: '连接已断开，请稍后重试' })
 
     store.destroy()
   })
