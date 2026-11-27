@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
 import QRCode from 'qrcode'
 import type { PeerInfo, SpaceSummary } from '../lib/protocol'
 import type { WsStatus } from '../lib/wsClient'
@@ -43,6 +43,20 @@ watch(
   },
   { immediate: true }
 )
+
+function onWindowKeydown(ev: KeyboardEvent): void {
+  if (ev.key === 'Escape' && props.roomModalOpen) {
+    emit('toggle-room-modal', false)
+  }
+}
+
+onMounted(() => {
+  window.addEventListener('keydown', onWindowKeydown)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', onWindowKeydown)
+})
 
 function startEditName(): void {
   nameInput.value = props.self?.name ?? ''
@@ -92,36 +106,47 @@ function copyInviteLink(): void {
 </script>
 
 <template>
-  <header class="border-b border-slate-800 bg-slate-900/90 px-4 py-3 backdrop-blur">
-    <div class="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3">
+  <header class="relative z-30 border-b border-[var(--border)] bg-[var(--bg-canvas)]/90 px-4 py-2.5 backdrop-blur-md">
+    <div class="flex min-h-8 flex-wrap items-center justify-between gap-3">
       <div class="flex items-center gap-3">
-        <h1 class="text-lg font-bold tracking-tight text-sky-400">PingDrop</h1>
-        <span
-          class="inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium"
-          :class="wsStatus === 'open' ? 'bg-emerald-500/15 text-emerald-300' : 'bg-amber-500/15 text-amber-300'"
-        >
-          <span class="h-1.5 w-1.5 rounded-full" :class="wsStatus === 'open' ? 'bg-emerald-400' : 'bg-amber-400'" />
-          {{ wsStatus === 'open' ? '已连接' : '重连中' }}
+        <h1 class="text-[15px] font-semibold tracking-tight text-[var(--text-primary)]">PingDrop</h1>
+
+        <span class="inline-flex items-center gap-1.5 text-xs text-[var(--text-secondary)]">
+          <span
+            class="h-2 w-2 rounded-full"
+            :style="{ backgroundColor: wsStatus === 'open' ? 'var(--success)' : 'var(--warning)' }"
+          />
+          <span>{{ wsStatus === 'open' ? '已连接' : '重连中' }}</span>
         </span>
-        <span class="rounded-md bg-slate-800 px-2.5 py-1 text-xs text-slate-200">
+
+        <span class="h-3 w-px bg-[var(--border-strong)]" aria-hidden="true" />
+
+        <span
+          class="text-xs"
+          :class="
+            space.kind === 'room' && space.code
+              ? 'font-mono font-medium tracking-wide text-[var(--text-primary)] tabular-nums'
+              : 'text-[var(--text-secondary)]'
+          "
+        >
           {{ space.kind === 'room' && space.code ? `房间 ${formatRoomCode(space.code)}` : '默认局域网' }}
         </span>
       </div>
 
-      <div class="flex flex-wrap items-center gap-2">
-        <div v-if="editingName" class="flex items-center gap-1">
+      <div class="flex flex-wrap items-center gap-1.5">
+        <div v-if="editingName" class="flex items-center gap-1.5">
           <label for="nickname-edit-input" class="sr-only">本机设备名称</label>
           <input
             id="nickname-edit-input"
             v-model="nameInput"
             data-testid="name-edit-input"
             maxlength="32"
-            class="w-36 rounded-md border border-slate-700 bg-slate-950 px-2 py-1 text-xs text-slate-100 outline-none focus:border-sky-500"
+            class="w-36 rounded-lg border border-[var(--border-strong)] bg-[var(--bg-canvas)] px-2.5 py-1 text-xs text-[var(--text-primary)] focus:border-[var(--accent)] focus:outline-none"
             @keydown.enter="onNameKeydown"
           />
           <button
             type="button"
-            class="rounded-md bg-sky-600 px-2 py-1 text-xs font-medium text-white hover:bg-sky-500"
+            class="rounded-lg bg-[var(--btn-primary-bg)] px-2.5 py-1 text-xs font-medium text-[var(--btn-primary-text)] hover:bg-[var(--btn-primary-hover)]"
             @click="submitName"
           >
             保存
@@ -131,17 +156,30 @@ function copyInviteLink(): void {
           v-else
           data-testid="edit-name-btn"
           type="button"
-          class="rounded-md border border-slate-700 px-2.5 py-1 text-xs text-slate-200 hover:border-slate-500"
+          class="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
           @click="startEditName"
         >
-          本机：{{ self?.name ?? '初始化中...' }}
+          <span>本机：{{ self?.name ?? '初始化中...' }}</span>
+          <svg
+            aria-hidden="true"
+            class="h-3 w-3 opacity-60"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.75"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M12 20h9" />
+            <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
+          </svg>
         </button>
 
         <button
           v-if="space.kind === 'room'"
           data-testid="return-lan-btn"
           type="button"
-          class="rounded-md border border-slate-700 px-2.5 py-1 text-xs text-slate-300 hover:border-slate-500"
+          class="rounded-lg px-2.5 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
           @click="emit('return-lan')"
         >
           返回局域网
@@ -149,7 +187,7 @@ function copyInviteLink(): void {
 
         <button
           type="button"
-          class="rounded-md bg-sky-600 px-3 py-1 text-xs font-medium text-white hover:bg-sky-500"
+          class="rounded-lg bg-[var(--btn-primary-bg)] px-3 py-1.5 text-xs font-medium text-[var(--btn-primary-text)] transition-colors hover:bg-[var(--btn-primary-hover)]"
           :aria-expanded="roomModalOpen"
           @click="emit('toggle-room-modal', !roomModalOpen)"
         >
@@ -160,44 +198,50 @@ function copyInviteLink(): void {
 
     <div
       v-if="roomModalOpen"
-      class="mx-auto mt-3 max-w-6xl rounded-xl border border-slate-800 bg-slate-950 p-4 shadow-xl"
+      class="mx-auto mt-3 max-w-4xl rounded-2xl border border-[var(--border)] bg-[var(--bg-surface)] p-5"
+      style="box-shadow: var(--shadow-popover)"
     >
-      <div class="grid gap-4 md:grid-cols-2">
+      <div class="grid gap-6 md:grid-cols-2">
         <div class="space-y-3">
-          <div class="flex items-center justify-between">
-            <h2 class="text-sm font-semibold text-slate-100">创建 / 分享 6 位私人房间</h2>
+          <div class="flex items-center justify-between gap-2">
+            <h2 class="text-xs font-semibold text-[var(--text-primary)]">分享私人房间</h2>
             <button
               data-testid="create-room-btn"
               type="button"
-              class="rounded-md bg-sky-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-sky-500"
+              class="rounded-lg border border-[var(--border-strong)] px-2.5 py-1 text-xs font-medium text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)]"
               @click="emit('create-room')"
             >
               生成新配对码
             </button>
           </div>
           <div v-if="space.kind === 'room' && space.code" class="flex items-center gap-4">
-            <img v-if="qrDataUrl" :src="qrDataUrl" alt="配对二维码" class="h-28 w-28 rounded-lg bg-white p-1" />
+            <img
+              v-if="qrDataUrl"
+              :src="qrDataUrl"
+              alt="配对二维码"
+              class="h-24 w-24 rounded-xl border border-[var(--border)] bg-white p-1.5"
+            />
             <div class="space-y-2">
-              <div class="font-mono text-2xl font-bold tracking-widest text-sky-300">
+              <div class="font-mono text-2xl font-semibold tracking-[0.18em] text-[var(--text-primary)] tabular-nums">
                 {{ formatRoomCode(space.code) }}
               </div>
               <button
                 data-testid="copy-invite-btn"
                 type="button"
-                class="rounded-md border border-slate-700 px-2.5 py-1 text-xs text-slate-200 hover:border-sky-500"
+                class="rounded-lg border border-[var(--border-strong)] px-2.5 py-1 text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
                 @click="copyInviteLink"
               >
                 复制直达链接
               </button>
             </div>
           </div>
-          <p v-else class="text-xs text-slate-400">
-            点击「生成新配对码」创建独立加密空间，手机 5G 或异地设备输入 6 位数字即可互通与暂存图文文件。
+          <p v-else class="text-xs leading-relaxed text-[var(--text-secondary)]">
+            生成 6 位配对码创建独立空间，异地设备输入配对码或扫码即可互通。
           </p>
         </div>
 
-        <div class="space-y-2">
-          <h2 class="text-sm font-semibold text-slate-100">输入 6 位配对码加入</h2>
+        <div class="space-y-3 border-t border-[var(--border)] pt-4 md:border-t-0 md:border-l md:pt-0 md:pl-6">
+          <h2 class="text-xs font-semibold text-[var(--text-primary)]">输入 6 位码加入</h2>
           <div class="flex gap-2">
             <label for="room-code-join-input" class="sr-only">6 位配对码</label>
             <input
@@ -205,15 +249,15 @@ function copyInviteLink(): void {
               data-testid="room-code-input"
               :value="codeInput"
               inputmode="numeric"
-              placeholder="例如 482917"
-              class="flex-1 rounded-md border border-slate-700 bg-slate-900 px-3 py-1.5 font-mono text-sm text-slate-100 outline-none focus:border-sky-500"
+              placeholder="000 000"
+              class="min-w-0 flex-1 rounded-lg border border-[var(--border-strong)] bg-[var(--bg-canvas)] px-3 py-1.5 font-mono text-sm tracking-widest text-[var(--text-primary)] tabular-nums placeholder:text-[var(--text-tertiary)] focus:border-[var(--accent)] focus:outline-none"
               @input="onCodeInput"
               @keydown.enter="onCodeKeydown"
             />
             <button
               data-testid="room-join-submit"
               type="button"
-              class="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-500 disabled:opacity-40"
+              class="rounded-lg bg-[var(--btn-primary-bg)] px-3.5 py-1.5 text-xs font-medium text-[var(--btn-primary-text)] transition-colors hover:bg-[var(--btn-primary-hover)] disabled:opacity-35"
               :disabled="codeInput.length !== 6"
               @click="submitJoin"
             >
@@ -221,7 +265,7 @@ function copyInviteLink(): void {
             </button>
             <button
               type="button"
-              class="rounded-md border border-slate-700 px-3 py-1.5 text-xs text-slate-300"
+              class="rounded-lg px-2.5 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
               @click="emit('toggle-room-modal', false)"
             >
               关闭

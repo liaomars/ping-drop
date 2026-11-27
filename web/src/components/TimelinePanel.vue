@@ -80,20 +80,20 @@ function confirmClear(): void {
 <template>
   <section
     data-testid="timeline-panel"
-    class="flex flex-col gap-3 rounded-xl border border-slate-800 bg-slate-900/60 p-4"
+    class="flex flex-col bg-[var(--bg-canvas)]"
     @dragover.prevent
     @drop.stop="onDropFiles"
   >
-    <div class="flex items-center justify-between">
-      <div>
-        <h2 class="text-sm font-semibold text-slate-100">共享时间线（文本 / 图片 / ≤{{ maxTimelineFileMB }}MB 小文件）</h2>
-        <p class="text-xs text-slate-400">支持离线后取，按空间隔离并在 TTL 到期后自动清理</p>
+    <div class="flex items-center justify-between border-b border-[var(--border)] px-5 py-3.5">
+      <div class="flex items-baseline gap-2.5">
+        <h2 class="text-sm font-semibold text-[var(--text-primary)]">共享时间线</h2>
+        <span class="tabular-nums text-xs text-[var(--text-tertiary)]">≤ {{ maxTimelineFileMB }} MB</span>
       </div>
       <button
         v-if="space.sharedTimelineEnabled && timeline.length > 0"
         data-testid="timeline-clear-btn"
         type="button"
-        class="rounded border border-rose-500/40 px-2 py-1 text-xs text-rose-300 hover:bg-rose-500/10"
+        class="rounded-md px-2 py-1 text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--danger-bg)] hover:text-[var(--danger)]"
         @click="confirmClearOpen = true"
       >
         清空
@@ -104,21 +104,23 @@ function confirmClear(): void {
       v-if="confirmClearOpen"
       role="alertdialog"
       aria-label="确认清空共享时间线"
-      class="flex items-center justify-between rounded-lg border border-rose-500/40 bg-rose-950/40 px-3 py-2 text-xs text-rose-200"
+      class="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--border)] px-5 py-2.5 text-xs"
+      style="background-color: var(--danger-bg); color: var(--danger)"
     >
       <span>确认清空当前空间的全部共享时间线内容吗？此操作不可撤销。</span>
-      <div class="flex gap-2">
+      <div class="flex items-center gap-2">
         <button
           data-testid="timeline-clear-confirm"
           type="button"
-          class="rounded bg-rose-600 px-2.5 py-1 font-medium text-white"
+          class="rounded-md px-2.5 py-1 font-medium text-white"
+          style="background-color: var(--danger)"
           @click="confirmClear"
         >
           确认清空
         </button>
         <button
           type="button"
-          class="rounded border border-slate-700 px-2.5 py-1 text-slate-300"
+          class="rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-1 text-[var(--text-primary)]"
           @click="confirmClearOpen = false"
         >
           取消
@@ -126,130 +128,186 @@ function confirmClear(): void {
       </div>
     </div>
 
-    <div
-      v-if="!space.sharedTimelineEnabled"
-      class="space-y-3 rounded-xl border border-dashed border-slate-700 bg-slate-950/60 p-6 text-center"
-    >
-      <p class="text-sm font-medium text-slate-200">默认局域网空间已关闭共享时间线</p>
-      <p class="text-xs text-slate-400">
-        为防止公司或公共 Wi-Fi 下误泄露剪贴板，局域网默认仅开放设备雷达点对点互传。开启 6 位码私人房间即可使用跨设备图文暂存。
+    <div v-if="!space.sharedTimelineEnabled" class="flex flex-1 flex-col items-center justify-center px-6 py-16 text-center">
+      <div class="mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-[var(--bg-subtle)] text-[var(--text-secondary)]">
+        <svg
+          aria-hidden="true"
+          class="h-5 w-5"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.6"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
+          <rect x="4" y="11" width="16" height="10" rx="2" />
+          <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+        </svg>
+      </div>
+      <p class="text-sm font-medium text-[var(--text-primary)]">局域网默认关闭共享时间线</p>
+      <p class="mt-1.5 max-w-sm text-xs leading-relaxed text-[var(--text-secondary)]">
+        保护公共网络剪贴板隐私，开启 6 位码私人房间即可跨端暂存图文。
       </p>
       <button
         data-testid="timeline-enable-room-btn"
         type="button"
-        class="rounded-md bg-sky-600 px-4 py-1.5 text-xs font-medium text-white hover:bg-sky-500"
+        class="mt-5 rounded-lg bg-[var(--btn-primary-bg)] px-4 py-2 text-xs font-medium text-[var(--btn-primary-text)] transition-colors hover:bg-[var(--btn-primary-hover)]"
         @click="emit('create-room')"
       >
-        一键开启 6 位码私人房间
+        开启 6 位码私人房间
       </button>
     </div>
 
     <template v-else>
-      <div class="hidden gap-2 md:flex">
-        <label for="timeline-draft-input" class="sr-only">发送文字到共享时间线</label>
-        <textarea
-          id="timeline-draft-input"
-          v-model="draftText"
-          rows="2"
-          placeholder="粘贴文字、截图（Ctrl/Cmd+V）或拖拽小文件到此处..."
-          class="flex-1 resize-none rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs text-slate-100 outline-none focus:border-sky-500"
-          @paste="onPaste"
-          @keydown.ctrl.enter.prevent="submitText"
-          @keydown.meta.enter.prevent="submitText"
-        />
-        <div class="flex flex-col gap-1.5">
-          <button
-            type="button"
-            class="rounded-md bg-sky-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-500"
-            @click="submitText"
-          >
-            发送
-          </button>
-          <input ref="fileInputEl" type="file" multiple class="hidden" @change="onPickFiles" />
-          <button
-            type="button"
-            class="rounded-md border border-slate-700 px-3 py-1.5 text-xs text-slate-200 hover:border-slate-500"
-            @click="fileInputEl?.click()"
-          >
-            传文件/图
-          </button>
-        </div>
-      </div>
-
-      <div class="max-h-[28rem] space-y-2.5 overflow-y-auto">
-        <div v-if="timeline.length === 0" class="rounded-lg border border-dashed border-slate-800 p-6 text-center text-xs text-slate-500">
-          暂无暂存内容，可发送文字或上传 ≤{{ maxTimelineFileMB }} MB 图片与文件
-        </div>
-
-        <article
-          v-for="item in timeline"
-          :key="item.id"
-          class="rounded-lg border border-slate-800 bg-slate-950/75 p-3 text-xs"
-        >
-          <div class="mb-2 flex items-center justify-between text-[11px] text-slate-400">
-            <span>{{ item.senderName }}</span>
-            <div class="flex items-center gap-2">
-              <button
-                v-if="item.kind === 'text' && item.text"
-                data-testid="timeline-copy-btn"
-                type="button"
-                class="text-sky-400 hover:underline"
-                @click="emit('copy-text', item.text)"
-              >
-                复制
-              </button>
-              <button
-                v-if="item.blobId"
-                type="button"
-                class="text-emerald-400 hover:underline"
-                @click="emit('download-item', item)"
-              >
-                下载
-              </button>
-              <button type="button" class="text-slate-500 hover:text-rose-400" @click="emit('delete-item', item.id)">
-                删除
-              </button>
-            </div>
-          </div>
-
-          <p v-if="item.kind === 'text' && item.text" class="whitespace-pre-wrap break-words text-slate-100">
-            <template v-for="(seg, idx) in parseTextSegments(item.text)" :key="idx">
-              <a
-                v-if="seg.kind === 'link'"
-                :href="seg.href"
-                target="_blank"
-                rel="noopener noreferrer"
-                class="text-sky-300 underline"
-              >{{ seg.text }}</a>
-              <span v-else>{{ seg.text }}</span>
-            </template>
-          </p>
-
-          <div v-else-if="item.kind === 'image' && item.blobId" class="space-y-1.5">
-            <img
-              v-if="blobPreviewUrls[item.blobId]"
-              :src="blobPreviewUrls[item.blobId]"
-              :alt="item.fileName ?? 'image'"
-              class="max-h-64 rounded-md border border-slate-800 object-contain"
+      <div class="native-scroll flex-1 overflow-y-auto px-5 py-5">
+        <div class="mx-auto flex max-w-3xl flex-col gap-5">
+          <div class="hidden rounded-xl border border-[var(--border-strong)] bg-[var(--bg-surface)] transition-colors focus-within:border-[var(--accent)] md:block">
+            <label for="timeline-draft-input" class="sr-only">发送文字到共享时间线</label>
+            <textarea
+              id="timeline-draft-input"
+              v-model="draftText"
+              rows="3"
+              placeholder="输入或粘贴文字、截图（⌘V），或直接拖入文件..."
+              class="w-full resize-none bg-transparent px-3.5 pt-3 pb-2 text-sm leading-relaxed text-[var(--text-primary)] placeholder:text-[var(--text-tertiary)] focus:outline-none"
+              @paste="onPaste"
+              @keydown.ctrl.enter.prevent="submitText"
+              @keydown.meta.enter.prevent="submitText"
             />
-            <div v-else class="text-slate-500">图片加载中...</div>
-            <div class="text-[11px] text-slate-400">{{ item.fileName }} ({{ formatBytes(item.size ?? 0) }})</div>
+            <div class="flex items-center justify-between border-t border-[var(--border)] px-3 py-2">
+              <div class="flex items-center gap-3">
+                <input ref="fileInputEl" type="file" multiple class="hidden" @change="onPickFiles" />
+                <button
+                  type="button"
+                  class="inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                  @click="fileInputEl?.click()"
+                >
+                  <svg
+                    aria-hidden="true"
+                    class="h-3.5 w-3.5"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.75"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  >
+                    <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+                  </svg>
+                  <span>添加文件或图片</span>
+                </button>
+                <span class="text-[11px] text-[var(--text-tertiary)]">⌘Enter 发送</span>
+              </div>
+
+              <button
+                type="button"
+                class="rounded-lg bg-[var(--btn-primary-bg)] px-3.5 py-1 text-xs font-medium text-[var(--btn-primary-text)] transition-colors hover:bg-[var(--btn-primary-hover)]"
+                @click="submitText"
+              >
+                发送
+              </button>
+            </div>
           </div>
 
-          <div v-else-if="item.kind === 'file'" class="flex items-center justify-between rounded-md bg-slate-900 px-3 py-2">
-            <div>
-              <div class="font-medium text-slate-100">{{ item.fileName }}</div>
-              <div class="text-[11px] text-slate-400">{{ formatBytes(item.size ?? 0) }}</div>
-            </div>
-            <button
-              type="button"
-              class="rounded bg-emerald-600/20 px-2.5 py-1 text-emerald-300 hover:bg-emerald-600/30"
-              @click="emit('download-item', item)"
-            >
-              安全下载
-            </button>
+          <div v-if="timeline.length === 0" class="py-14 text-center text-xs text-[var(--text-tertiary)]">
+            暂无暂存内容，发送文字或上传 ≤{{ maxTimelineFileMB }} MB 图片与文件
           </div>
-        </article>
+
+          <div v-else class="space-y-3">
+            <article
+              v-for="item in timeline"
+              :key="item.id"
+              class="group rounded-xl border border-[var(--border)] bg-[var(--bg-surface)] px-4 py-3.5 transition-colors hover:border-[var(--border-strong)]"
+            >
+              <div class="mb-2 flex items-center justify-between text-[11px] text-[var(--text-tertiary)]">
+                <span class="font-medium text-[var(--text-secondary)]">{{ item.senderName }}</span>
+                <div class="flex items-center gap-3 transition-opacity md:opacity-60 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
+                  <button
+                    v-if="item.kind === 'text' && item.text"
+                    data-testid="timeline-copy-btn"
+                    type="button"
+                    class="hover:text-[var(--text-primary)]"
+                    @click="emit('copy-text', item.text)"
+                  >
+                    复制
+                  </button>
+                  <button
+                    v-if="item.blobId"
+                    type="button"
+                    class="hover:text-[var(--text-primary)]"
+                    @click="emit('download-item', item)"
+                  >
+                    下载
+                  </button>
+                  <button
+                    type="button"
+                    class="hover:text-[var(--danger)]"
+                    @click="emit('delete-item', item.id)"
+                  >
+                    删除
+                  </button>
+                </div>
+              </div>
+
+              <p v-if="item.kind === 'text' && item.text" class="whitespace-pre-wrap break-words text-sm leading-relaxed text-[var(--text-primary)]">
+                <template v-for="(seg, idx) in parseTextSegments(item.text)" :key="idx">
+                  <a
+                    v-if="seg.kind === 'link'"
+                    :href="seg.href"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="text-[var(--accent)] underline underline-offset-2"
+                  >{{ seg.text }}</a>
+                  <span v-else>{{ seg.text }}</span>
+                </template>
+              </p>
+
+              <div v-else-if="item.kind === 'image' && item.blobId" class="space-y-2">
+                <img
+                  v-if="blobPreviewUrls[item.blobId]"
+                  :src="blobPreviewUrls[item.blobId]"
+                  :alt="item.fileName ?? 'image'"
+                  class="max-h-72 rounded-lg border border-[var(--border)] object-contain"
+                />
+                <div v-else class="text-xs text-[var(--text-tertiary)]">图片加载中...</div>
+                <div class="tabular-nums text-[11px] text-[var(--text-tertiary)]">
+                  {{ item.fileName }} · {{ formatBytes(item.size ?? 0) }}
+                </div>
+              </div>
+
+              <div
+                v-else-if="item.kind === 'file'"
+                class="flex items-center justify-between gap-3 rounded-lg bg-[var(--bg-subtle)] px-3 py-2.5"
+              >
+                <div class="flex min-w-0 items-center gap-2.5">
+                  <svg
+                    aria-hidden="true"
+                    class="h-4 w-4 shrink-0 text-[var(--text-secondary)]"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.6"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  >
+                    <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" />
+                    <polyline points="14 2 14 8 20 8" />
+                  </svg>
+                  <div class="min-w-0">
+                    <div class="truncate text-xs font-medium text-[var(--text-primary)]">{{ item.fileName }}</div>
+                    <div class="tabular-nums text-[11px] text-[var(--text-tertiary)]">{{ formatBytes(item.size ?? 0) }}</div>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  class="shrink-0 rounded-md border border-[var(--border-strong)] bg-[var(--bg-surface)] px-2.5 py-1 text-xs font-medium text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)]"
+                  @click="emit('download-item', item)"
+                >
+                  下载
+                </button>
+              </div>
+            </article>
+          </div>
+        </div>
       </div>
     </template>
   </section>

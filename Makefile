@@ -38,4 +38,4 @@ build-linux: build-web
 	$(DOCKER_RUN) sh -c 'CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o bin/ping-drop-linux-amd64 ./cmd/ping-drop'
 
 dev:
-	$(DOCKER_BASE) -p 8080:8080 $(GO_DOCKER_IMAGE) go run ./cmd/ping-drop --addr :8080
+	$(DOCKER_BASE) -p 18080:8080 $(GO_DOCKER_IMAGE) go run ./cmd/ping-drop --addr :8080
